@@ -1,0 +1,979 @@
+---
+title: "Empirical_Exercise_#4_Sean_Jung"
+author: "Sean Jung"
+date: "11/14/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+rm(list = ls(all = TRUE))
+setwd("C:/Users/seanj/Desktop/Social Network Analytics/HW4")
+
+
+library(taRifx)
+library(data.table)
+library(zoo)
+library(igraph)
+library(plotly)
+library(ggplot2)
+library(Matrix)
+library(proxy)
+library(MASS)
+
+# Uncomment and run the code below to load the file without having to run code again
+#loadhistory(file = ".Rhistory")
+```
+
+# Data Preparation Part I
+
+Here, we are setting up our data in a way that makes it efficient to work with three main dataset: Producer, Films, and Keywords
+
+• The file “producers_and_films.csv” contains information on film production companies and the film projects that they produce.
+```{r}
+# We can start by defining film categories, using producer economies of scale and coreness in co-production network of producers
+
+# Refer to the answer key for Empirical Exercise 1 to 3 on generating core-periphery network
+
+# Generate core-periphery position in the collaboration network
+
+# First, we are focusing on making a network out of producer_film edge list
+producer_film = fread("producers_and_films.csv", head = TRUE)
+#View(producer_film)
+
+# US will be coded 1 while other countries will be coded 0
+producer_film[, us := sum(country != "us" & country != "") == 0, by = pindex]
+
+producer_film = producer_film[us == 1]
+
+producer_film[, dup := .N , by = c("pcindex", "pindex")]
+producer_film = producer_film[dup == 1]
+
+producer_film[, number_of_producers := .N, by = pindex]
+
+#View(producer_film)
+
+producer_film_coproduce = producer_film[number_of_producers > 1]
+#View(producer_film_coproduce)
+
+# Expand to get the producer pairs for each film
+producer_film_coproduce_split = split(producer_film_coproduce, 
+                                      f = producer_film_coproduce$pindex)
+
+# Thank you very much for your help! We now have Producer and Film undirected edge list
+producer_film_pair = lapply(seq_along(producer_film_coproduce_split), 
+                            function(i) t(combn(producer_film_coproduce_split[[i]]$pcindex, 2)))
+
+# Create data table
+producer_film_dt = lapply(seq_along(producer_film_coproduce_split), function(i) data.table(producer1 = producer_film_pair[[i]][,1], producer2 = producer_film_pair[[i]][,2], pindex = producer_film_coproduce_split[[i]]$pindex[1], year = producer_film_coproduce_split[[i]]$year[1]))
+
+# Use rbindlist() to properly coerce it into a data table
+producer_film_dt = rbindlist(producer_film_dt)
+
+# Make the network undirected
+producer_film_dt = rbindlist(list(producer_film_dt, data.table(producer_film_dt[, c("producer2", "producer1", "pindex", "year")])), use.names = FALSE)
+
+producer_film_dt = producer_film_dt[producer1 < producer2]
+head(producer_film_dt)
+
+# Count unique pairs after sorting it by tge first two columns
+setorderv(producer_film_dt, c("producer1", "producer2", "pindex"))
+producer_film_dt[, weight := seq_len(.N), by = c("producer1", "producer2")]
+
+years = sort(unique(producer_film_dt$year))
+years = years[years <= 2016]
+
+# Here, we are building a cumulative yearly network 
+years_edge = lapply(seq_along(years), 
+                    function(i) producer_film_dt[year <= years[i]])
+
+# (WE DON'T UNDERSTAND WHY WE ARE DOING THIS STEP) We can use a 10-year renewal period to get rid of decayed ties, no need to include this portion but helps to get rid of companies that are no longer in business
+for(i in seq_along(years)){
+    years_edge[[i]][, tie_age := years[i] - year]
+    years_edge[[i]] = years_edge[[i]][tie_age <= 10]
+}
+
+producer_network = lapply(seq_along(years), function(i) graph.data.frame(years_edge[[i]][,c("producer1","producer2","weight")], directed = FALSE))
+
+# Next, we can use eigenvector centrality to get coreness for each year
+coreness = lapply(seq_along(years), function(i) eigen_centrality(producer_network[[i]])$vector)
+
+coreness = lapply(seq_along(years), function(i) data.table(pcindex = names(coreness[[i]]), coreness = coreness[[i]], year = years[i]))
+
+# We can set up object to merge back into main data
+coreness = rbindlist(coreness)
+
+# Then, sort for taking prior average within producer
+setorderv(coreness, c("pcindex", "year"))
+
+# Here, we fill non-existent rows in the prior average with 0s
+coreness[, coreness_history := rollapplyr(coreness, list(-(10:1)), mean, partial = TRUE, fill = 0), by = pcindex]
+
+# Finally, we can set threshold
+coreness[, generalist_net_upperq := coreness_history > quantile(coreness_history, .75), by = year]
+```
+
+# Data Prepation Part II
+• The file “box_office_revenues.csv” contains information about the box office revenues for each film
+```{r}
+# Here, we are calculating generalism based on producer scale, incorporating box office information along the way
+box = fread("box_office_revenues.csv", header = TRUE, key = "pindex")
+
+producers = fread("producers_and_films.csv", header = TRUE, key = "pindex")
+
+pbox = merge(producers, box)
+
+# This line only keeps producers in the US
+pbox[, us := sum(country != "us" & country != "") == 0, by = pindex]
+
+pbox = pbox[us == 1]
+
+# Here, we are calculating yearly box office for each producer, as well as the screen release coverage
+yearly_box = unique(pbox[, list(total_box = sum(total_box), count_films = .N, release_coverage = sum(release_coverage), budget = sum(budget)), by = c("pcindex", "year")])
+
+# Please note that this way we could have defined a generalist by box office as well
+yearly_box[, generalist_count := count_films > quantile(count_films, .75), by = year]
+
+yearly_box[, generalist_box := total_box > quantile(total_box, .75), by = year]
+
+setkeyv(yearly_box, c("pcindex", "year"))
+setkeyv(pbox, c("pcindex", "year"))
+film_category = merge(pbox, yearly_box)
+
+# Here, we are merging with coreness from previous block of code
+setkeyv(coreness, c("pcindex", "year"))
+
+film_category = merge(film_category, coreness, all.x = TRUE)
+
+film_category[is.na(generalist_net_upperq), generalist_net_upperq := 0]
+
+film_category[, coproduction := .N > 1, by = pindex]
+
+film_category = unique(film_category[, list(generalist_film_count = sum(generalist_count) == .N, 
+                                            specialist_film_count = sum(generalist_count) == 0, hybrid_film_count = sum(generalist_count) > 0 & sum(generalist_count) < .N, 
+                                            generalist_film_net = sum(generalist_net_upperq, na.rm = TRUE) == .N, 
+                                            specialist_film_net = sum(generalist_net_upperq, na.rm = TRUE) == 0, 
+                                            hybrid_film_net = sum(generalist_net_upperq, 
+                                                                  na.rm = TRUE) > 0 & sum(generalist_net_upperq, 
+                                                                                          na.rm = TRUE) < .N, 
+                                            coproduction = coproduction), by = pindex])
+
+# Here, we are establishing 5 solo and coproduction types for each definition of generalism
+film_category[generalist_film_count == TRUE & coproduction == 0, category_count := "gsolo_count"]
+film_category[specialist_film_count == TRUE & coproduction == 0, category_count := "ssolo_count"]
+film_category[generalist_film_count == TRUE & coproduction == 1, category_count := "gcoprod_count"]
+film_category[specialist_film_count == TRUE & coproduction == 1, category_count := "scoprod_count"]
+film_category[hybrid_film_count == TRUE, category_count := "hcoprod_count"]
+
+film_category[generalist_film_net == TRUE & coproduction == 0, category_net := "gsolo_net"]
+film_category[specialist_film_net == TRUE & coproduction == 0, category_net := "ssolo_net"]
+film_category[generalist_film_net == TRUE & coproduction == 1, category_net := "gcoprod_net"]
+film_category[specialist_film_net == TRUE & coproduction == 1, category_net := "scoprod_net"]
+film_category[hybrid_film_net == TRUE, category_net := "hcoprod_net"]
+
+# Here, we are getting get rid of extra columns by specifiying only the columns we want
+film_category = film_category[, c("pindex", "category_count", "category_net")]
+```
+
+# Question 1 - Part A
+• The file “film_keywords.csv” contains a list of keywords used in each film. Keywords represent low-level plot, aesthetic, and stylistic elements of each film
+
+Classify each film by the type of collaboration that it represents. There should be five types for each measure of generalism:
+i. Peripheral solo productions: films made by a single specialist
+ii. Central solo productions: films made by a single generalist
+iii. Central co-productions: films made by a group of multiple generalists
+iv. Peripheral co-productions: films made by a group of multiple specialists
+v. Hybrid co-productions: films made by a group of generalists and specialists
+
+For each measure of generalism, a figure that illustrates the number of new keywords
+and new combinations of existing keywords that are introduced per type of film over
+the course of the data. On the x-axis should be years, and on the y-axis should be the
+count of new keywords or new combinations.
+```{r}
+# Next, we can count the new keywords, using the original keyword data
+keywords = fread("film_keywords.csv", head = TRUE)
+
+# Don't forget that can exclude some non-descriptive keywords that don't provide too much information about plot and style - (THIS STEP IS NOT NECESSARY FOR THE ASSIGNMENT BUT MAY HELP FOR THE GENERAL NETWORK ANALYSIS)
+
+# We can do this based on an index and a key in data table
+index = c("one-word-title", 
+          "title-spoken-by-character", 
+          "character-name-in-title", 
+          "cult-film", 
+          "independent-film", 
+          "two-word-title", 
+          "box-office-flop", 
+          "box-office-hit", 
+          "character-repeating-someone-else's-dialogue", 
+          "three-word-title", 
+          "written-by-director", 
+          "place-name-in-title", 
+          "voice-over-narration", 
+          "no-opening-credits", 
+          "number-in-title", 
+          "product-placement", 
+          "blockbuster", 
+          "subtitled-scene", 
+          "opening-action-scene", 
+          "title-directed-by-female", 
+          "scene-during-end-credits")
+
+# Set the index
+setkey(keywords, keyword)
+
+# Remove keywords that are not part of the index
+keywords = keywords[!index]
+
+# We can also subset to just producers in the United States using the seq_len(.N) command and we can do this by expanding keyword data by producers
+producers[, producer_seq := seq_len(.N), 
+          by = pindex]
+
+# Set the index
+setkey(keywords, pindex)
+
+# We are setting up the "master" object that contains all three dimensions: (1) films, (2) producers, and (3) keywords
+keywords_producers = lapply(seq_len(max(producers$producer_seq)), function(i) merge(producers[producer_seq == i], keywords))
+
+# Coerce it into a data table
+keywords_producers = rbindlist(keywords_producers)
+
+# We are doing a same step here; we are subsetting non-US countries 0; while US countries 1.
+keywords_producers[, us := sum(country != "us" & country != "") == 0, by = pindex]
+keywords_producers = keywords_producers[us == 1]
+
+# Create a column named 'first_appearance_year' that indicates when a keyword first appear by using min(year) command
+keywords_producers[, first_appearance_year := min(year), by = keyword]
+
+# We can consider a keyword new if it appears in its minimum year or the 2 years after
+keywords_producers[, new_keyword := first_appearance_year == year | first_appearance_year + 1 == year | first_appearance_year + 2 == year]
+
+# We can just keep one entry per keyword per film
+keywords = keywords_producers[producer_seq == 1,]
+
+# Then, assign a film category to each keyword
+setkey(film_category, pindex)
+setkey(keywords, pindex)
+
+# Merge them together by using merge() function
+keywords_categories = merge(keywords, film_category)
+
+# Here, we are trying to calculate how many of a film's keywords are new
+new_keywords_film = unique(keywords_categories[, list(category_count, 
+                                                      category_net, 
+                                                      new_keywords = sum(new_keyword), 
+                                                      total_keywords = .N, 
+                                                      year = year), 
+                                               by = pindex])
+
+# By year
+yearly_new_keywords_count = unique(new_keywords_film[, list(total_new_keywords = mean(new_keywords)), by = c("category_count", "year")])
+
+yearly_new_keywords_net = unique(new_keywords_film[, list(total_new_keywords = mean(new_keywords)), by = c("category_net", "year")])
+
+# Return a table that contains information about yearly new keywords count and its respective year
+table(yearly_new_keywords_count$category_count, 
+      yearly_new_keywords_count$year)
+
+table(yearly_new_keywords_net$category_net, 
+      yearly_new_keywords_net$year) 
+# Note that not all categories have entries for each year
+
+# We do not attempt to account for general solos in year 2002
+yearly_new_keywords_count = rbindlist(list(yearly_new_keywords_count, list("gsolo_count", 2002, NA)))
+
+# Additionally, there is no general solos, co-productions, or hybrids in year 1985
+yearly_new_keywords_net = rbindlist(list(yearly_new_keywords_net, 
+                                         list("gsolo_net", 1985, NA),
+                                         list("gcoprod_net", 1985, NA), 
+                                         list("hcoprod_net", 1985, NA)))
+
+# setorder() command allows fast row reordering of a data.table by reference (year)
+setorder(yearly_new_keywords_count, year)
+setorder(yearly_new_keywords_net, year)
+
+# Here, we are plotting a series of graphs using plotly (instead of ggplot) to draw a figure that illustrates the number of new keywords and new combinations of existing keywords that are introduced per film type over the years
+# x-axis is denoted to display years, while the y-axis should be the count of new keywords or new combinations
+# Refer to the plot_ly examples covered in the class and the link below:
+# https://plotly.com/r/line-and-scatter/ 
+font = list(family = "Tahoma", size = 12, color = "black")
+
+p1 = plot_ly(x = unique(yearly_new_keywords_count$year), 
+             y = yearly_new_keywords_count$total_new_keywords[yearly_new_keywords_count$category_count=="ssolo_count"], 
+             name = "Peripheral solo productions", 
+             type = "scatter", 
+             mode = "lines") %>%
+    add_trace(y = yearly_new_keywords_count$total_new_keywords[yearly_new_keywords_count$category_count=="gsolo_count"], 
+              name = "Central solo productions", 
+              mode = "lines+markers") %>%
+    add_trace(y = yearly_new_keywords_count$total_new_keywords[yearly_new_keywords_count$category_count=="gcoprod_count"], 
+              name = "Central co-productions", 
+              mode = "lines+markers", 
+              line = list(dash = "dash")) %>%
+    add_trace(y = yearly_new_keywords_count$total_new_keywords[yearly_new_keywords_count$category_count=="scoprod_count"], 
+              name = 'Peripheral co-productions', 
+              line = list(dash = "dash")) %>%
+    add_trace(y = yearly_new_keywords_count$total_new_keywords[yearly_new_keywords_count$category_count=="hcoprod_count"], 
+              name = 'Hybrid coproductions', 
+              line = list(dash = "dot")) %>%
+    layout(yaxis = list(title = "Total number of new features used")) %>%
+    layout(xaxis = list(title = "Production year")) %>%
+    layout(title = "Total Number of New Features Introduced in a Film by Co-production Type, 1985-2016")
+p1
+
+
+p2 = plot_ly(x = unique(yearly_new_keywords_net$year), 
+             y = yearly_new_keywords_net$total_new_keywords[yearly_new_keywords_net$category_net=="ssolo_net"], 
+             name = "Peripheral solo productions", 
+             type = "scatter", 
+             mode = "lines") %>%
+    add_trace(y = yearly_new_keywords_net$total_new_keywords[yearly_new_keywords_net$category_net=="gsolo_net"], 
+              name = "Central solo productions", 
+              mode = "lines+markers") %>%
+    add_trace(y = yearly_new_keywords_net$total_new_keywords[yearly_new_keywords_net$category_net=="gcoprod_net"], 
+              name = "Central co-productions", 
+              mode = "lines+markers", 
+              line = list(dash = "dash")) %>%
+    add_trace(y = yearly_new_keywords_net$total_new_keywords[yearly_new_keywords_net$category_net=="scoprod_net"], 
+              name = 'Peripheral co-productions', 
+              line = list(dash = "dash")) %>%
+    add_trace(y = yearly_new_keywords_net$total_new_keywords[yearly_new_keywords_net$category_net=="hcoprod_net"], 
+              name = 'Hybrid coproductions', 
+              line = list(dash = "dot")) %>%
+    layout(yaxis = list(title = "Total number of new features used")) %>%
+    layout(xaxis = list(title = "Production year")) %>%
+    layout(title = "Total Number of New Features Introduced in a Film by Co-production Type, 1985-2016")
+p2
+
+
+# What about the new combinations of existing keywords?
+keywords_yearly = split(keywords, f = keywords$year)
+keywords_yearly = lapply(seq_along(keywords_yearly), function(i) keywords_yearly[[i]][keywords_yearly[[i]]$producer_seq == 1])
+
+# Retrieve keyword dyad list for each year
+item.fac = lapply(seq_along(keywords_yearly), 
+                  function(i) factor(keywords_yearly[[i]]$pindex))
+
+target.fac = lapply(seq_along(keywords_yearly), 
+                    function(i) factor(keywords_yearly[[i]]$keyword))
+
+# We are applying sparse matrix for keywords used each year
+incidence = lapply(seq_along(keywords_yearly), function(i) 
+        sparseMatrix(
+                                        as.numeric(item.fac[[i]]), 
+                                        as.numeric(target.fac[[i]]),
+                                        dimnames = list(
+                                        as.numeric(unique(item.fac[[i]])), 
+                                        as.character(unique(target.fac[[i]]))),
+                                        x = 1)
+        )
+
+# Compute the cooccurence table that contains matrix that is multiplied by its transpose
+cooccurrence = lapply(seq_along(keywords_yearly), 
+                      function(i) t(incidence[[i]])%*%incidence[[i]])
+
+# Calculate edges in the cooccurrence table using the graph.adjacency() function 
+edges = lapply(seq_along(keywords_yearly), 
+               function(i) get.edgelist(graph.adjacency(cooccurrence[[i]], "undirected")))
+
+edges = lapply(seq_along(keywords_yearly), 
+               function(i) cbind(edges[[i]], keywords_yearly[[i]]$year[1]))
+edges = do.call(rbind, edges)
+
+edges = edges[!edges[,1] == edges[,2],]
+
+# We are allowing to check to see if edges can be appeared both ways
+edges = rbind(edges, cbind(edges[,2], edges[,1], edges[,3]))
+
+# We can consider a combination new if it appears in its minimum year or the 2 years after to allow time for the production process
+edges = data.table(keyword1 = edges[,1], 
+                   keyword2 = edges[,2], 
+                   year = as.numeric(edges[,3]))
+
+# We are checking here when did a combination first appear
+edges[, first_appearance_year := min(year), 
+      by = c("keyword1", "keyword2")]
+
+edges[, new_combination := first_appearance_year == year | first_appearance_year + 1 == year]
+
+# We are just keeping the pairs that are new by subletting the edges that satisfies new_combination==1, and we can check these against the pairs that appear in each film
+new_combinations = edges[new_combination == 1]
+
+# We are only considering new combinations of old/existing keywords
+keyword_films = keywords[new_keyword == FALSE]
+keyword_films = split(keywords, f = keywords$pindex)
+
+# We can remove these with an index checking if there are at least two keywords 
+keyword_pairs = lapply(seq_along(keyword_films), 
+                       function(i) tryCatch(cbind(t(combn(keyword_films[[i]]$keyword, 2)), 
+                                                  keyword_films[[i]]$pindex[1], keyword_films[[i]]$year[1]), 
+                                            error = function(e) NULL))
+
+keyword_pairs = do.call(rbind, keyword_pairs) # By using do.call() function, we get a table ignoring the null values 
+
+# Let's create a data table that consists of 4 columns as specified below
+keyword_pairs = data.table(keyword1 = keyword_pairs[,1], 
+                           keyword2 = keyword_pairs[,2], 
+                           pindex = as.numeric(keyword_pairs[,3]), 
+                           year = as.numeric(keyword_pairs[,4]))
+colnames(keyword_pairs)
+
+# We are merging the producer combinations to the film combinations (inner join)
+setkeyv(keyword_pairs, c("keyword1", "keyword2"))
+setkeyv(new_combinations, c("keyword1", "keyword2"))
+
+# use all.x = TRUE here to perform left join to ensure that films that do no have at least 2 keywords are not regarded as missing data
+keyword_pairs_new = merge(keyword_pairs, 
+                          new_combinations[,-c("year")], 
+                          all.x = TRUE)
+
+colnames(keyword_pairs_new)
+
+# Set the index
+setkey(keyword_pairs_new, pindex)
+
+# Inner join
+keyword_pairs_new = merge(keyword_pairs_new, film_category)
+
+# Set the value of zero for the NAs in the new_combination table
+keyword_pairs_new[is.na(new_combination), new_combination := 0]
+
+# We are computing how many new combinations are there per film
+new_combinations_film = unique(keyword_pairs_new[, list(category_count, category_net, new_combinations = sum(new_combination), total_combinations = .N, year = year), by = pindex])
+
+# and by year
+yearly_new_combinations_count = unique(new_combinations_film[, list(total_new_combinations = mean(new_combinations)), by = c("category_count", "year")])
+yearly_new_combinations_net = unique(new_combinations_film[, list(total_new_combinations = mean(new_combinations)), by = c("category_net", "year")])
+
+# Coerce it properly using rbindlist()
+yearly_new_combinations_count = rbindlist(list(yearly_new_combinations_count, list("gsolo_count", 2002, NA)))
+yearly_new_combinations_net = rbindlist(list(yearly_new_combinations_net, list("gsolo_net", 1985, NA), list("gcoprod_net", 1985, NA), list("hcoprod_net", 1985, NA)))
+
+# Set the index
+setorder(yearly_new_combinations_count, year)
+setorder(yearly_new_combinations_net, year)
+
+# Here, we are plotting again using the same plot_ly() function
+p3 = plot_ly(x = unique(yearly_new_combinations_count$year), 
+             y = yearly_new_combinations_count$total_new_combinations[yearly_new_combinations_count$category_count=="ssolo_count"], 
+             name = "Peripheral solo productions", 
+             type = "scatter", 
+             mode = "lines") %>%
+    add_trace(y = yearly_new_combinations_count$total_new_combinations[yearly_new_combinations_count$category_count=="gsolo_count"], 
+              name = "Central solo productions", 
+              mode = "lines+markers") %>%
+    add_trace(y = yearly_new_combinations_count$total_new_combinations[yearly_new_combinations_count$category_count=="gcoprod_count"], 
+              name = "Central co-productions", 
+              mode = "lines+markers", 
+              line = list(dash = "dash")) %>%
+    add_trace(y = yearly_new_combinations_count$total_new_combinations[yearly_new_combinations_count$category_count=="scoprod_count"], 
+              name = 'Peripheral co-productions', 
+              line = list(dash = "dash")) %>%
+    add_trace(y = yearly_new_combinations_count$total_new_combinations[yearly_new_combinations_count$category_count=="hcoprod_count"],
+              name = 'Hybrid co-productions', 
+              line = list(dash = "dot")) %>%
+    layout(yaxis = list(title = "Number of new combinations of existing features introduced")) %>%
+    layout(xaxis = list(title = "Production year")) %>%
+    layout(title = "Total New Combinations of Existing Features Introduced in a Film by Co-production Type, 1985-2016", 
+           font = font)
+p3
+
+p4 = plot_ly(x = unique(yearly_new_combinations_net$year), 
+             y = yearly_new_combinations_net$total_new_combinations[yearly_new_combinations_net$category_net=="ssolo_net"], 
+             name = "Peripheral solo productions", 
+             type = "scatter", 
+             mode = "lines") %>%
+    add_trace(y = yearly_new_combinations_net$total_new_combinations[yearly_new_combinations_net$category_net=="gsolo_net"], 
+              name = "Central solo productions", 
+              mode = "lines+markers") %>%
+    add_trace(y = yearly_new_combinations_net$total_new_combinations[yearly_new_combinations_net$category_net=="gcoprod_net"], 
+              name = "Central co-productions", 
+              mode = "lines+markers", 
+              line = list(dash = "dash")) %>%
+    add_trace(y = yearly_new_combinations_net$total_new_combinations[yearly_new_combinations_net$category_net=="scoprod_net"], 
+              name = 'Peripheral co-productions', 
+              line = list(dash = "dash")) %>%
+    add_trace(y = yearly_new_combinations_net$total_new_combinations[yearly_new_combinations_net$category_net=="hcoprod_net"], 
+              name = 'Hybrid co-productions', 
+              line = list(dash = "dot")) %>%
+    layout(yaxis = list(title = "Number of new combinations of existing features introduced")) %>%
+    layout(xaxis = list(title = "Production year")) %>%
+    layout(title = "Total New Combinations of Existing Features Introduced in a Film by Co-production Type, 1985-2016", 
+           font = font)
+p4
+```
+
+# Question 1 - Part B - Data Cleaning
+```{r}
+# First, we get the new keywords and film category info combined with the box office info we made before
+setkey(pbox, pindex)
+setkey(new_keywords_film, pindex)
+setkey(new_combinations_film, pindex)
+
+# Set the column names
+colnames(film_category)[colnames(film_category) == "category_count"] = "coproduction_type"
+setkey(film_category, pindex)
+
+# Merge two tables
+pbox_new = merge(pbox, new_keywords_film[,-c("year")])
+pbox_new = merge(pbox_new, new_combinations_film[,-c("year", "category_count", "category_net")])
+
+pbox_new[, gcoprod_count := category_count == "gcoprod_count"]
+pbox_new[, scoprod_count := category_count == "scoprod_count"]
+pbox_new[, hcoprod_count := category_count == "hcoprod_count"]
+pbox_new[, gsolo_count := category_count == "gsolo_count"]
+pbox_new[, ssolo_count := category_count == "ssolo_count"]
+
+pbox_new[, gcoprod_net := category_net == "gcoprod_net"]
+pbox_new[, scoprod_net := category_net == "scoprod_net"]
+pbox_new[, hcoprod_net := category_net == "hcoprod_net"]
+pbox_new[, gsolo_net := category_net == "gsolo_net"]
+pbox_new[, ssolo_net := category_net == "ssolo_net"]
+
+# Second, we set up the controls for subsidiary and multidimensional scaling
+subsidiary = fread("production_subsidiaries.csv", head = TRUE, key = "pcindex")
+#View(subsidiary)
+setkey(pbox_new, pcindex)
+
+# Check the type
+typeof(pbox_new)
+typeof(subsidiary)
+
+# Left join
+pbox_new = merge(pbox_new, subsidiary, all.x = TRUE)
+
+pbox_new[!is.na(first_year), subsidiary := year >= first_year & year <= last_year]
+pbox_new[is.na(subsidiary), subsidiary := 0]
+#View(pbox_new)
+
+# We calculate it by each year again
+yearly_box_new = unique(pbox_new[, list(total_box = sum(total_box), 
+                                        count_films = .N, 
+                                        release_coverage = sum(release_coverage), 
+                                        budget = sum(budget), 
+                                        new_keywords = sum(new_keywords), 
+                                        new_combinations = sum(new_combinations), 
+                                        gcoprod_count = sum(gcoprod_count), 
+                                        scoprod_count = sum(scoprod_count), 
+                                        hcoprod_count = sum(hcoprod_count), 
+                                        gsolo_count = sum(gsolo_count), 
+                                        ssolo_count = sum(ssolo_count), 
+                                        gcoprod_net = sum(gcoprod_net), 
+                                        scoprod_net = sum(scoprod_net), 
+                                        hcoprod_net = sum(hcoprod_net), 
+                                        gsolo_net = sum(gsolo_net), 
+                                        ssolo_net = sum(ssolo_net), 
+                                        prod_company, 
+                                        subsidiary), 
+                                 by = c("pcindex", "year")]) # We are performing multidimensional scaling here
+
+#View(yearly_box_new)
+
+# We can reuse the combined keywords and producers object that we made before
+# We want comparison set to be spanning three years: from current year, from the previous year, or one year before the previous year
+years = sort(unique(keywords_producers$year))
+#View(years)
+
+keywords_producers[, as.character(years) := lapply(years, function(x) year == x | year == x -1 | year == x - 2)]
+#View(keywords_producers)
+
+# We are setting up windows object by subsetting it to each year from 1985 to 2018
+keywords_yearly = list(keywords_producers[keywords_producers$"1985" == TRUE], keywords_producers[keywords_producers$"1986" == TRUE], keywords_producers[keywords_producers$"1987" == TRUE], keywords_producers[keywords_producers$"1988" == TRUE], keywords_producers[keywords_producers$"1989" == TRUE], keywords_producers[keywords_producers$"1990" == TRUE], keywords_producers[keywords_producers$"1991" == TRUE], keywords_producers[keywords_producers$"1992" == TRUE], keywords_producers[keywords_producers$"1993" == TRUE], keywords_producers[keywords_producers$"1994" == TRUE], keywords_producers[keywords_producers$"1995" == TRUE], keywords_producers[keywords_producers$"1996" == TRUE], keywords_producers[keywords_producers$"1997" == TRUE], keywords_producers[keywords_producers$"1998" == TRUE], keywords_producers[keywords_producers$"1999" == TRUE], keywords_producers[keywords_producers$"2000" == TRUE], keywords_producers[keywords_producers$"2001" == TRUE], keywords_producers[keywords_producers$"2002" == TRUE], keywords_producers[keywords_producers$"2003" == TRUE], keywords_producers[keywords_producers$"2004" == TRUE], keywords_producers[keywords_producers$"2005" == TRUE], keywords_producers[keywords_producers$"2006" == TRUE], keywords_producers[keywords_producers$"2007" == TRUE], keywords_producers[keywords_producers$"2008" == TRUE], keywords_producers[keywords_producers$"2009" == TRUE], keywords_producers[keywords_producers$"2010" == TRUE], keywords_producers[keywords_producers$"2011" == TRUE], keywords_producers[keywords_producers$"2012" == TRUE], keywords_producers[keywords_producers$"2013" == TRUE], keywords_producers[keywords_producers$"2014" == TRUE], keywords_producers[keywords_producers$"2015" == TRUE], keywords_producers[keywords_producers$"2016" == TRUE], keywords_producers[keywords_producers$"2017" == TRUE], keywords_producers[keywords_producers$"2018" == TRUE])
+
+# Next, we set up sparse matrix for keywords used by each producer in each 3-year window. We can apply factor() function directly to make the matrix
+incidence = lapply(seq_along(keywords_yearly), function(l)
+        sparseMatrix(i = as.numeric(factor(keywords_yearly[[l]]$keyword)),
+                j = as.numeric(factor(keywords_yearly[[l]]$pcindex)),
+                x = rep(1, nrow(keywords_yearly[[l]])),
+                dimnames = list(levels(factor(keywords_yearly[[l]]$keyword)), levels(factor(keywords_yearly[[l]]$pcindex)))
+         )
+)
+
+# What are the columns in this table?
+colnames(incidence)
+
+# Here we can set up dist matrix and mdcoords for producers
+# first, we have to initialize the list
+jaccard_dist = list()
+mdscale_year = list()
+mdcoords = list()
+jaccard_square = list()
+prod_names = list()
+distances = list()
+
+# Take a look at it
+seq_along(keywords_yearly)
+
+## THIS FOR LOOP TAKES ABOUT AN HOUR TO RUN
+for(i in seq_along(keywords_yearly)){
+    jaccard_dist = dist(as.matrix(incidence[[i]]), 
+                        method = "jaccard", 
+                        by_rows = FALSE)
+    mdscale_year = cmdscale(jaccard_dist, k = 2)
+    # We need to manipulate the year here to relabel years of the lags to all represent the most recent year and not recycle them from the year vector when making the data table.
+    # This entails that all producers from a grouped year being represented by that grouped year. Thus, comparisons can be made across coproduction types and coordinates as the producers appearing in that year and not the year of their lags
+    setorder(keywords_yearly[[i]], -year)
+    mdcoords[[i]] = data.table(pcindex = names(jaccard_dist), 
+                               coord1 = mdscale_year[,1], 
+                               coord2 = mdscale_year[,2], 
+                               year = keywords_yearly[[i]]$year[1])
+
+    # We can use this loop to skip ahead to get the distances for Question 2 as well
+    # This for loop will take about an hour to run
+    jaccard_square = as.matrix(jaccard_dist)
+    prod_names = t(combn(colnames(jaccard_square), 2))
+    jaccard_dist = as.numeric(jaccard_dist)
+    distances[[i]] = data.table(producer1 = prod_names[,1], 
+                                producer2 = prod_names[,2], 
+                                distance = jaccard_dist, 
+                                year = keywords_yearly[[i]]$year[1])
+    print(data.table(year = keywords_yearly[[i]]$year[1], 
+                     time = Sys.time())) # We can use this syntax to check the progress of the loop to ensure that we are still running the loop. If there is an error, This will help us know which line prompted such error
+    flush.console()
+
+    # If the available memory is insufficient, we can also export each iteration to a csv file individually and then load back in, with something using append = TRUE
+    #fwrite(mdcoords[[i]], file = "producer_multidimensional_coordinates_yearly.csv", append = TRUE)
+    #fwrite(distances[[i]], file = "producer_jaccard_distances_yearly.csv", append = TRUE)
+}         
+
+# Bind them together using rbindlist()
+mdcoords = rbindlist(mdcoords)
+distances = rbindlist(distances)
+#fwrite(mdcoords, "producer_multidimensional_coordinates_yearly_11_19.csv")
+#fwrite(distances, "producer_jaccard_distances_yearly_11_19.csv")
+
+# To read this data back in, simply call fread() function to bring back in 
+mdcoords = fread("producer_multidimensional_coordinates_yearly_11_19.csv", head = TRUE)
+head(mdcoords)
+
+distances = fread("producer_jaccard_distances_yearly_11_19.csv", head = TRUE)
+head(distances)
+
+# Set the index
+setkeyv(mdcoords, c("pcindex", "year"))
+setkeyv(yearly_box_new, c("pcindex", "year"))
+    
+# Left join
+yearly_box_new = merge(yearly_box_new, mdcoords, all.x = TRUE)
+
+# We create a new column named 'age' that is created by iterating all the rows in the table
+yearly_box_new[, age := seq_len(.N), by = pcindex]
+
+# Create a list of key-value pairs 
+count_films_keywords = unique(keywords_producers[, list(count_films_key = length(unique(pindex))), by = c("pcindex", "year")])
+#View(count_films_keywords)
+
+setkeyv(count_films_keywords, c("pcindex", "year"))
+
+# Merge the two tables together
+yearly_box_new = merge(yearly_box_new, count_films_keywords)
+#View(yearly_box_new)
+```
+# Question 1 - Part B
+For each measure of generalism, estimate one regression predicting the number of new
+keywords and another regression predicting the number of new combinations of existing
+keywords producers introduce in a year.  Use as predictors the number of films a producer makes that year that year that fall into each of the three co-production types. So, there will be three collaboration predictors:
+i. Central co-productions: number of Central co-productions a producer made that year
+ii. Peripheral co-productions: number of Peripheral co-productions a producer made that year
+iii. Hybrid co-productions: number of Hybrid co-productions a producer made that year
+```{r}
+# New keywords ~ Count
+summary(glm.nb(new_keywords ~ gcoprod_count + 
+                              scoprod_count + 
+                              hcoprod_count + 
+                              coord1 + 
+                              coord2 + 
+                              total_box + 
+                              age + 
+                              subsidiary + 
+                              factor(year), 
+                              data = yearly_box_new[year > 1987],
+                              offset(count_films_key)))
+
+# New keywords ~ Network
+summary(glm.nb(new_keywords ~ gcoprod_net + 
+                              scoprod_net + 
+                              hcoprod_net + 
+                              coord1 + 
+                              coord2 + 
+                              total_box + 
+                              age + 
+                              subsidiary + 
+                              factor(year), 
+                              data = yearly_box_new[year > 1987],
+                              offset(count_films_key)))
+
+# New combinations ~ Count
+summary(glm.nb(new_combinations ~ gcoprod_count + 
+                                  scoprod_count + 
+                                  hcoprod_count + 
+                                  coord1 + 
+                                  coord2 + 
+                                  total_box + 
+                                  age + 
+                                  subsidiary + 
+                                  factor(year), 
+                                  data = yearly_box_new[year > 1987],
+                                  offset(count_films_key)))
+
+# New combinations ~ Network
+summary(glm.nb(new_combinations ~ gcoprod_net + 
+                                  scoprod_net + 
+                                  hcoprod_net + 
+                                  coord1 + 
+                                  coord2 + 
+                                  total_box + 
+                                  age + 
+                                  subsidiary + 
+                                  factor(year), 
+                                  data = yearly_box_new[year > 1987],
+                                  offset(count_films_key)))
+
+# From the output, we can see that both generalist collaborations and hybrid collaborations are highly related to creative innovation
+```
+
+# Question 2
+Generate this measure yearly for each producer—again, to account for the natural time cycle of the production process, use as the comparison set for similarity the current year as well as the two years before the current year.
+
+Create a figure that illustrates how the distance between a producer and the other producers it works with relates to the number of new keywords a producer introduces each year.
+
+What does the pattern suggest about what kinds of collaborative partnerships might result in more creative innovation? Does this help to explain the results from Question 1?
+```{r}
+# We can use the distances we used as inputs to the multidimensional scaling used in the previous question
+distances = rbindlist(list(distances, 
+                           distances[, c("producer2","producer1", 
+                                         "distance","year")]), 
+                      use.names =  FALSE)
+
+# Calculate the average distance
+avg_dist = unique(distances[,list(average_dist = mean(distance)),
+                            by = c("producer1", "year")])
+
+# Set the column names
+colnames(avg_dist)[colnames(avg_dist) == "producer1"] = "pcindex"
+setkeyv(avg_dist, c("pcindex", "year"))
+
+# Left join
+yearly_box_new = merge(yearly_box_new, avg_dist, all.x = TRUE)
+colnames(yearly_box_new)
+
+# Plot for new keywords
+ggplot(yearly_box_new, aes(average_dist, new_keywords)) + 
+  geom_smooth(method = "loess", se = T) +
+  labs(x = "Average Jaccard distance", 
+       y = "New keywords")
+
+# plot for new combinations
+ggplot(yearly_box_new, aes(average_dist, new_combinations)) + 
+  geom_smooth(method = "loess", se = T) + 
+  labs(x = "Average Jaccard distance", 
+       y = "New combinations of existing keywords")
+
+# From output, we can see the downward-sloping line, and this may indicate that creative innovation are more likely to occur when producers can combine more distant knowledge bases
+```
+
+# Question 3
+Define each producer’s yearly return as its yearly box office revenue divided by the total release coverage it invested in for that year for its films.
+
+Estimate a regression predicting producers’ standardized return using the core-periphery classification to define generalists and specialists
+```{r}
+# Here, we are generating return and standardized_return variable within year
+# Return is calculated by dividing release_coverage from total_box
+# Standardized return is calculated by standardizing, meaning subtracting the mean and divide it by the standard deviation value
+yearly_box_new[, return := total_box/release_coverage]
+yearly_box_new[, standardized_return := (return - mean(return, na.rm = TRUE))/sd(return, na.rm = TRUE), by = year]
+
+# Perform the regression for box office standardized return
+summary(lm(standardized_return ~ gcoprod_count + 
+                                 scoprod_count + 
+                                 hcoprod_count + 
+                                 coord1 + 
+                                 coord2 + 
+                                 age + 
+                                 subsidiary + 
+                                 factor(year), 
+                                 data = yearly_box_new))
+
+summary(lm(standardized_return ~ gcoprod_net + 
+                                 scoprod_net + 
+                                 hcoprod_net + 
+                                 coord1 + 
+                                 coord2 + 
+                                 age + 
+                                 subsidiary + 
+                                 factor(year), 
+                                 data = yearly_box_new))
+# When comparing two regressions together, we can see that generalist collaboration is more likely to lead to higher box office returns
+```
+# Question 4
+Collaborations can be financially risky because of the coordination required to integrate multiple producers’ experiences into a making new film. Do producers gain anything from these collaborations creatively or financially in the long term?
+
+# Part A
+Estimate a regression predicting the count of new keywords introduced in a producer’s solo produced films in a year.
+
+Use as a predictor the cumulative number of new keywords a producer has introduced
+in all of its films through the current year that were made in “hybrid” collaborations.
+```{r}
+# Here, we can reuse the producers and films object (pbox_new) to further split out new keywords and combinations from different collaboration types such as "ssolo_net" and "gsolo_net"
+new_solo = unique(pbox_new[category_net == "ssolo_net" | category_net == "gsolo_net", list(new_keywords_solo = sum(new_keywords)), by = c("pcindex", "year")])
+
+new_hybrid = unique(pbox_new[category_net == "hcoprod_net", 
+                             list(new_keywords_hybrid = sum(new_keywords)), 
+                             by = c("pcindex", "year")])
+
+# Set the index
+setkeyv(new_solo, c("pcindex", "year"))
+setkeyv(new_hybrid, c("pcindex", "year"))
+
+# Left join to add the columns onto the existing yearly producer object
+yearly_box_new = merge(yearly_box_new, new_solo, all.x = TRUE)
+yearly_box_new = merge(yearly_box_new, new_hybrid, all.x = TRUE)
+
+# When keywords are NOT found in any collaboration type, assign them a value of zero
+yearly_box_new[is.na(new_keywords_solo), new_keywords_solo := 0]
+yearly_box_new[is.na(new_keywords_hybrid), new_keywords_hybrid := 0]
+
+# Calculate the cumulative stock of new keywords from collaborations
+yearly_box_new[, stock_new_keywords_hybrid := cumsum(new_keywords_hybrid), by = "pcindex"]
+
+# Perform regressions for new keywords and new combinations
+summary(glm.nb(new_keywords_solo ~  stock_new_keywords_hybrid + 
+                                    coord1 + 
+                                    coord2 + 
+                                    total_box + 
+                                    age + 
+                                    subsidiary + 
+                                    factor(year), 
+                                    data = yearly_box_new[year > 1987],
+                                    offset(count_films_key))) # From the output, we can see that creative innovation achieved via hybrid collaborations is more likely to be associated with more keywords that are being introduced
+```
+
+# Part B
+Accounting for a producer’s engaging in collaborations, does introducing new keywords
+result in higher box office returns?
+
+To gain insight into this, estimate the same regression model from Question 2, but add in a predictor for the number of new keywords introduced.
+
+Does this result help explain why producers might engage in collaborations, even though they can be financially risky?
+```{r}
+####### Part B
+summary(lm(standardized_return ~ new_combinations + 
+                                 gcoprod_net + 
+                                 scoprod_net + 
+                                 hcoprod_net + 
+                                 coord1 + 
+                                 coord2 + 
+                                 age + 
+                                 subsidiary + 
+                                 factor(year), 
+                                 data = yearly_box_new)) # From the output, we can see that more creative innovation, made possible via new keywords and more new combinations, is more likely to result in higher box office returns. This is profound insight as it tells some collaboration may be risky at the beginning but can reap the awards of high return and innovation later down the road. This is a very important measure for the large traditional conglomerates which are known to be less adaptable
+```
+
+5. As explored in Question 2, one way that collaborations between major studios and smaller independents can result in innovative films is because their knowledge resources are complementary. Majors can bring in know-how from managerial processes and distribution and independents bring in avant-garde creative ideas.
+
+Perform a regression similar to those in Question 1 in to further test these ideas. Compute a continuous measure of generalism based on the creative distance spanned by the genres a production company uses. You can find the genres associated with each film in the file “films_and_genres.csv”. 
+
+Create a measure of your choice that considers a production company to be more of a generalist when it has more genres in its portfolio that are more dissimilar to one another, in the sense that it releases many diversified kinds of films. 
+
+Does a production company introduce more new keywords when it works with companies that have a different level of generalism than it does?
+```{r}
+genre = fread("films_and_genres.csv", head = TRUE)
+View(genre)
+
+# -- SKIP FOR NOW
+```
+
+
+# Extra Credit
+We also have information about the people that work on films as cast members. These include actors, writers, directors, and other kinds of creative talent. The file “film_cast_members.csv” contains a unique key identifying the creative talent and describes what role they worked on as a member of the cast of each film.
+
+Perform a regression to find out: do generalists try to hire creative talent that has more experience working on hybrid co-productions, using the continuous measure of generalism from Question 5?
+
+Next perform a regression to find out, for these generalists, does hiring creative talent that has more experience working on hybrid co-productions related to introducing more new keywords in their films?
+
+Perform a regression to find out: does engaging in these kinds of collaborations with different levels of generalism seem to help with hiring more innovative creative talent?
+```{r}
+# We start by assigning a variable named 'cast' that contains information about cast working history
+cast = fread("film_cast_members.csv", head = TRUE)
+
+# We are getting rid of unnecessary columns that are not helpful in analysis
+pcs_films = unique(keywords_categories[,-c("keyword","first_appearance_year","keyindex")])
+
+# Set the index
+setkey(pcs_films, pindex)
+setkey(cast, pindex)
+
+# Merge two dataset together (Inner join by default)
+film_category_cast = merge(pcs_films[producer_seq == 1], 
+                           cast[,c("pindex", "nconst")])
+typeof(film_category_cast) # list
+colnames(film_category_cast)
+
+# We are computing the new keywords associated with each cast member based on films they have worked on 
+# First, set the index
+setorderv(film_category_cast, c("nconst", "year"))
+
+# Second, assign a value named 'new_keyword_exp' that is computed by taking cumulative summation of the values in a variable 'new_keyword' 
+film_category_cast[, new_keyword_exp := cumsum(new_keyword), by = nconst]
+head(film_category_cast$new_keyword_exp, 20)
+
+# Third, find the maximum value of new keyword and assign them to a variable named 'new_keyword_exp'
+film_category_cast_year = unique(film_category_cast[, list(new_keyword_exp = max(new_keyword_exp)), by = c("nconst", "year")])
+
+setorderv(film_category_cast_year, c("nconst", "year"))
+
+colnames(film_category_cast_year) # "nconst", "year", "new_keyword_exp "
+
+# This command shifts values one year back
+film_category_cast_year[, current_year := year]
+film_category_cast_year[, year := shift(current_year, 1, type = "lead"), by = "nconst"]
+
+# Sanity check
+head(film_category_cast_year$year, 20)
+
+# Set the index
+setkeyv(film_category_cast_year, c("nconst", "year"))
+
+# The following command allows for merging each cast member into a single data object, allowing the key to be unique within each iteration of "orderings"
+orderings = sort(unique(cast$ordering))
+orderings
+
+pcs_cast = lapply(seq_along(orderings), 
+                  function(i) merge(pcs_films, 
+                                    cast[ordering == ordering[i],
+                                         c("pindex", "nconst")]))
+
+pcs_cast = rbindlist(pcs_cast)
+colnames(pcs_cast)
+
+# Set the index
+setkeyv(pcs_cast, c("nconst", "year"))
+
+# Inner join
+pcs_cast = merge(pcs_cast, film_category_cast_year)
+
+# We are computing yearly object for each producer with cast experience/innovation information
+pcs_exp_year = unique(pcs_cast[,list(new_keyword_exp = sum(new_keyword_exp)), 
+                               by = c("pcindex", "year")])
+
+# We are merging back to main data
+setkeyv(pcs_exp_year, c("pcindex", "year"))
+setkeyv(yearly_box_new, c("pcindex", "year"))
+
+# Left join
+yearly_box_new = merge(yearly_box_new, 
+                       pcs_exp_year, 
+                       all.x = TRUE)
+
+# We are setting up regression for count outcome
+summary(glm.nb(new_keyword_exp ~ hcoprod_count + 
+                                 gcoprod_count + 
+                                 scoprod_count + 
+                                 coord1 + 
+                                 coord2 + 
+                                 total_box + 
+                                 age + 
+                                 subsidiary + 
+                                 factor(year), 
+                                 data = yearly_box_new)) # From the output, it appears that engaging in more hybrid coproductions is more likely to result in hiring process that yields more innovative cast members
+
+#savehistory(file = ".Rhistory")
+```

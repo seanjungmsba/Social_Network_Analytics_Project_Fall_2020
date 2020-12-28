@@ -1,0 +1,991 @@
+---
+title: "Empirical_Exercise_#6_Sean_Jung"
+author: "Sean Jung"
+date: "12/02/2020"
+output: html_document
+---
+
+# Import Packages
+```{r}
+rm(list = ls(all = TRUE))
+
+library(data.table)
+library(lubridate)
+library(stringr)
+library(splitstackshape)
+library(igraph)
+library(zoo)
+library(geosphere)
+library(Hmisc)
+library(RSiena)
+```
+# Data Import
+```{r}
+# The file “execs.csv” contains information on startup executives and the startup companies they represent. These are each given by the unique identifiers “PersonId” and “CompanyId.”
+execs = fread("execs.csv", head = TRUE)
+colnames(execs) = make.names(colnames(execs))
+
+# We only focus the set of entrepreneurs just on those whose Full Title is indicated to be “Founder”, “Chief Executive Officer”, or “Managing Director
+execs = execs[grepl("Chief Executive Officer", Full.Title) | grepl("Founder", Full.Title) | grepl("Managing Director", Full.Title)]
+
+# The file “individual_investors.csv” contains information on individual investors and the startup companies that they choose to fund
+investors = fread("individual_investors.csv", head = TRUE)
+colnames(investors) = make.names(colnames(investors))
+
+# The file “deals_details.csv” contains information on each individual deal, such as its type and size—this is identical to the file with the same name from Exercise 5
+deals = fread("deal_details.csv", head = TRUE)
+colnames(deals) = make.names(colnames(deals))
+
+# The file “people.csv” contains background information about each person, such as their education and gender
+people = fread("people.csv", head = TRUE)
+colnames(people) = make.names(colnames(people))
+people = people[,c("PersonId", "Gender", "Education")]
+
+# Set up edges
+execs[, exec_no := seq_len(.N), by = CompanyId]
+```
+
+```{r}
+# Here, we import the files from exercise 5 that contains information incorporating status of investor in relation to investor exits
+statuses = fread("yearly_individual_investor_status.csv", head = TRUE, key = c("Investor.Id", "year"))
+
+# Get rid of junk columns
+execs[, Date_Joined_Board := NULL]
+execs[, Date_Left_Board := NULL]
+execs[, Last_Updated := NULL]
+
+# split up such that it can provide unique key for merge later
+execs_split = split(execs, f = execs$exec_no)
+for(i in seq_along(execs_split)){
+	setkey(execs_split[[i]], CompanyId)
+}
+setkey(investors, CompanyId)
+edges = list()
+for(i in seq_along(execs_split)){
+	edges[[i]] = merge(investors, execs_split[[i]])
+	print(paste0("executive no. ", i))
+	flush.console()
+}
+
+# Coerce it into dataframe
+edges = rbindlist(edges)
+
+# Set the column names
+colnames(edges)[colnames(edges) == "PersonId.x"] = "investor"
+colnames(edges)[colnames(edges) == "PersonId.y"] = "exec"
+edges[, Last.Updated := NULL]
+
+# Reorders the rows of a data.table based on the columns
+setorderv(edges, c("DealId", "investor", "exec", "CompanyId", "exec_no", "InvestorId", "Role"))
+setorderv(edges, c("investor", "exec", "DealId", "CompanyId", "exec_no", "InvestorId", "Role"))
+
+# Remove edges when investor is not an executive
+edges = edges[investor != exec]
+
+# Set the index
+setkey(deals, DealId)
+setkey(edges, DealId)
+
+# Merge
+edges = merge(edges, deals[,-2])
+```
+```{r}
+# Check the column anmes
+colnames(edges)
+
+# Format the columns appropriately
+edges[, date := as.Date(Deal_Date, "%m/%d/%Y")]
+edges[, year := year(date)]
+
+# We want to consider ties while individual is working at company
+# When did they start working?
+edges[, joined_date := as.Date(Date.Joined.Company, "%m/%d/%Y")]
+
+# When did they stop working?
+edges[, left_date := as.Date(Date.Left.Company, "%m/%d/%Y")]
+
+# Additional data cleaning
+# When employee joins later than the date, put them in exclude_date_joined column
+edges[!is.na(joined_date) & !is.na(date), exclude_date_joined := joined_date > date]
+edges[is.na(joined_date), exclude_date_joined := FALSE]
+
+# When employee left the company before the date, put them in the exclude_date_left column
+edges[!is.na(left_date) & !is.na(date), exclude_date_left := left_date < date]
+edges[is.na(left_date), exclude_date_left := FALSE]
+
+# Order it
+setorderv(edges, c("exec", "date"))
+
+# Import company_details.csv that contains info about founder and company 
+companies = fread("company_details.csv", header = TRUE)
+colnames(companies)[1] = "CompanyId"
+colnames(companies) = make.names(colnames(companies))
+
+# Set the index
+setkey(companies, CompanyId)
+setkey(edges, CompanyId)
+
+# Merge them together
+edges = merge(edges, companies[, c("CompanyId", "Primary_Industry_Sector", "Primary_Industry_Group", "Primary_Industry_Code", "Business_Status", "City", "State")])
+edges[, founder_deal_seq := seq_len(.N), by = c("exec", "CompanyId")]
+
+# Define successful venture as below:
+edges[, successful_venture := as.numeric(sum(Deal_Type_1 == "IPO" | Deal_Type_1 == "Buyout/LBO" | Deal_Type_1 == "Merger/Acquisition" | Business_Status == "Generating Revenue" | Business_Status == "Profitable") > 0), by = c("CompanyId")]
+
+# We only want Venture Capitalist
+edges = edges[Deal_Class == "Venture Capital"]
+
+# Order it
+setorderv(edges, c("investor", "exec", "date"))
+
+# Set the column name - when the value in people column equals to "PerosnId", we are setting their value to an "investor"
+colnames(people)[colnames(people) == "PersonId"] = "investor"
+setkey(people, investor)
+setkey(edges, investor)
+
+# Merge them together
+edges = merge(edges, people)
+
+# Set the column name - when the value in people column equals to "investor", we are setting their value to an "exec"
+colnames(people)[colnames(people) == "investor"] = "exec"
+setkey(people, exec)
+setkey(edges, exec)
+
+# Set the the Last.Updated value to NULL
+edges[, Last.Updated.x := NULL]
+edges[, Last.Updated.y := NULL]
+
+# Merge them again
+edges = merge(edges, people)
+
+# These lines of code allows the edge list to be bipartite
+# non-executives that are in the investor 
+# non-investors that are in executive
+edges = edges[!exec %in% investor]
+edges = edges[!investor %in% exec]
+
+# We also want to use grepl function to set their value into certain column based on the pattern. For example, all the x column will contain investor and y column will contain executive. If the text contains "MBA", then we want to store them in respective column as shown below:
+edges[, mba_investor := grepl("MBA", Education.x)]
+edges[, mba_exec := grepl("MBA", Education.y)]
+
+edges[, phd_investor := grepl("Ph.D.", Education.x)]
+edges[, phd_exec := grepl("Ph.D.", Education.y)]
+
+edges[, finance_investor := grepl("Financ", Education.x)]
+edges[finance_investor == FALSE, finance_investor := grepl("financ", Education.x)]
+
+edges[, finance_exec := grepl("Financ", Education.y)]
+edges[finance_exec == FALSE, finance_exec := grepl("financ", Education.y)]
+
+edges[, engineer_investor := grepl("Engineer", Education.x)]
+edges[engineer_investor == FALSE, engineer_investor := grepl("engineer", Education.x)]
+
+edges[, engineer_exec := grepl("Engineer", Education.y)]
+edges[engineer_exec == FALSE, engineer_exec := grepl("engineer", Education.y)]
+
+# We are identifying ivy league schools
+ivy_smart = c("Brown", "Caltech", "University of Chicago", "Cornell", "Dartmouth", "Duke", "Harvard", "MIT", "University of Pennsylvania", "Princeton", "Yale", "Stanford", "Cambridge", "Oxford")
+
+# Same thing as previously. x column for investor; y column for executive
+edges[, ivy_plus_investor := grepl(paste(ivy_smart,collapse = "|"), Education.x)]
+edges[, ivy_plus_exec := grepl(paste(ivy_smart,collapse = "|"), Education.y)]
+```
+
+```{r}
+# The file “investor_details.csv” contains information about the investment firms that each individual investor represents, including their geographic location. This is identical to the file with the same name from Exercise #5
+investor_firm_detailed = fread("investor_details.csv", head = TRUE)
+colnames(investor_firm_detailed) = make.names(colnames(investor_firm_detailed))
+
+# Set the index
+setkey(edges, "InvestorId")
+setkey(investor_firm_detailed, "InvestorId")
+
+# Merge them together
+edges = merge(edges, investor_firm_detailed)
+
+# We want to consider the deals that are closed previously 
+# In first_investment_round column, we now can see how many times one invested in a company where there is a distinct founder
+edges[, first_investment_round := seq_len(.N) == 1, by = c("investor", "exec", "CompanyId")]
+
+# When the value of the first_investment_round is NULL, we want to set the boolean value of first_investment_round as FALSE
+edges[is.na(first_investment_round), first_investment_round := FALSE]
+
+# Create distinct_investments that is computed by cumulatively summing the values in the first_investment_round
+edges[, distinct_investments := cumsum(first_investment_round), by = c("investor", "exec")]
+
+# Consider prior familiarity being defined as any kind of working relationship
+edges[, first_investment_round := NULL]
+edges[, distinct_investments := NULL]
+
+# Order the column
+setorderv(edges, c("investor", "exec", "CompanyId", "date"))
+edges[, first_investment_round := seq_len(.N) == 1, by = c("investor", "exec", "CompanyId")]
+edges[is.na(first_investment_round), first_investment_round := FALSE]
+edges[, distinct_investments := cumsum(first_investment_round), by = c("investor", "exec")]
+
+# Define distinctive_investment_success being the cumulative sum of multiplication of first_investment_round by successful venture
+edges[, distinct_investments_success := cumsum(first_investment_round*successful_venture), by = c("investor", "exec")]
+
+# Define distinct_investments_nonsuccess by subtracting the successful investments from the total investments
+edges[, distinct_investments_nonsuccess := distinct_investments - distinct_investments_success, by = c("investor", "exec")]
+
+# Define prior_investments as being number of distinct_investment minus 1
+edges[, prior_investments := distinct_investments - 1]
+
+## TOOK TWO DAYS TO RUN
+edges[first_investment_round == TRUE, prior_investments_success := shift(distinct_investments_success, n=1, fill=NA, type="lag"), by = c("investor", "exec")]
+edges[, prior_investments_success := max(prior_investments_success, na.rm = TRUE), by = c("investor", "exec", "CompanyId")]
+edges[is.infinite(prior_investments_success), prior_investments_success := 0]
+```
+
+```{r}
+# for this analysis, we only consider entrepreneurs who have already been a part of company in the past, to model their re-entry into the investment network on their second or subsequent company
+setorderv(edges, c("exec", "date"))
+edges = edges[, first_investment_round_exec := seq_len(.N) == 1, by = c("exec", "CompanyId")]
+
+# For the missing value, set the value to FALSE
+edges[is.na(first_investment_round_exec), first_investment_round_exec := FALSE]
+
+# Same setup as before; distinct_investments_exec is defined by cumsum value of first_investment_round_exec
+edges[, distinct_investments_exec := cumsum(first_investment_round_exec), by = exec]
+
+# Order the column
+setorderv(edges, c("investor", "date"))
+edges = edges[, first_investment_round_investor := seq_len(.N) == 1, by = c("investor", "CompanyId")]
+edges[is.na(first_investment_round_investor), first_investment_round_investor := FALSE]
+# By Cum-summing we get the number of deals for each investor
+edges[, distinct_investments_investor := cumsum(first_investment_round_investor), by = investor]
+
+# We want to know how long investors and entrepreneurs have been in the business
+edges[, first_year_investor := min(year, na.rm = TRUE), by = "investor"]
+edges[, first_year_exec := min(year, na.rm  = TRUE), by = "exec"]
+
+# For example, let's determine the group of investor who invested in computer sector because it has been HOT!
+invested = edges[year > 1997 & year <= 2017 & Primary.Industry.Group == "Computer Hardware"]
+
+# Set the value to NULL for now
+invested[, Last.Updated.x := NULL]
+invested[, Last.Updated.y := NULL]
+
+# Only looking at male investor
+invested[, gender_inv := Gender.x == "Male"]
+invested[, gender_exec := Gender.y == "Male"]
+```
+
+```{r}
+# Read in data related to geographic distance from edges_dist
+# Background on estimating the distances: a member of last year’s MSBA cohort was able estimate the geographic location of each headquarters by using airport data to match the location of each investor firm and startup company’s city to the closest airport nearby.
+# The RData file “edges_dist.RData” contains, for each deal in the data, the longitude and latitude of each investor firm, indicated by the column “InvestorId”, and the longitude and latitude of each startup company, indicated by the column “CompanyId”. These can be merged into the main data using these unique keys
+load("edges_dist.RData")
+setkeyv(edges_dist, c("InvestorId", "CompanyId"))
+setkeyv(invested, c("InvestorId", "CompanyId"))
+
+# Left join
+invested = merge(invested, edges_dist, all.x = TRUE)
+
+# Background on estimating the different ethnic groups: the file “representative_names.csv” is drawn from data from the 2015 US Census that indicates, among the 50,000 most common last names, the proportion of each individuals from each distinct ethnic group defined by the census that have this last name
+rep_names = fread("representative_names.csv", head = TRUE)
+# The file “people.csv” contains background information about each person, such as their education and gender
+people_names = fread("people.csv", head = TRUE)
+colnames(people_names) = make.names(colnames(people_names))
+colnames(rep_names)[1] = "Last.Name"
+
+# Change the elements of a character vector to lower case
+people_names[, Last.Name := toupper(Last.Name)]
+
+# Set the idex
+setkey(people_names, Last.Name)
+setkey(rep_names, Last.Name)
+
+# Merge
+people_names = merge(people_names, rep_names)
+
+# Set the column names accordingly
+colnames(people_names)[colnames(people_names) == "PersonId" | colnames(people_names) == "race"] = c("investor", "race_inv")
+
+# Set the index
+setkey(people_names, investor)
+setkey(invested, investor)
+
+# Left join
+invested = merge(invested, people_names[,c("investor", "Last.Name", "race_inv")], all.x = TRUE)
+
+# Set the column names accordingly
+colnames(people_names)[colnames(people_names) == "investor" | colnames(people_names) == "race_inv"] = c("exec", "race_exec")
+
+# Set the index
+setkey(people_names, exec)
+setkey(invested, exec)
+
+# Left merge
+invested = merge(invested, people_names[,c("exec", "Last.Name", "race_exec")], all.x = TRUE)
+
+# Set the Update column to NULL
+invested[, Last.Updated.x := NULL]
+invested[, Last.Updated.y := NULL]
+
+# Order the column
+setkeyv(invested, c("investor", "year"))
+
+# Left join
+invested = merge(invested, statuses, all.x = TRUE)
+
+# Here, we want to subset to complete observations of covariates
+invested = invested[!is.na(ivy_plus_exec) &
+	                  !is.na(gender_exec) &
+	                  !is.na(comp_lon) &
+                  	!is.na(race_exec) &
+                  	!is.na(ivy_plus_investor) &
+                  	!is.na(gender_inv) &
+                  	!is.na(inv_lon) &
+                  	!is.na(race_inv)]
+
+# Factorize the investor and exec column to make it categorical variable
+invested$investor = as.factor(invested$investor)
+invested$exec = as.factor(invested$exec)
+
+# Define all years encompassing minimum investment year to maximum investment year
+allyears = seq(min(invested$year, na.rm = TRUE), 
+               max(invested$year, na.rm = TRUE))
+
+# Wave is defined when all years equals to years
+invested[, wave := which(allyears == year), by = year]
+```
+
+```{r}
+# Here, we are setting up yearly network by deleting edges that occur after wave it
+
+# First, we want to define entry_times that encompasses all the time existing in invested dataset of which the value of wave is minimum
+entry_times = rbind(invested[, list(entry_wave = min(wave)), by = investor], invested[, list(entry_time = min(wave)), by = exec], use.names = FALSE)
+
+# Find unique value from the entry_times dataset we just assigned
+entry_times_unique = unique(entry_times[, list(entry_wave = min(entry_wave)), by = investor])
+
+# Sort the unique values 
+waves = sort(unique(invested$wave))
+
+# Define joined_investors and joined_exec variable as follows:
+# They are unique entry time value that has investor value in invested data
+joined_investors = entry_times_unique[investor %in% invested$investor]
+joined_exec = entry_times_unique[investor %in% invested$exec]
+
+# Take consideration into investors entering data
+joined_investors = lapply(seq_len(nrow(joined_investors)), function(i) c(joined_investors[i,entry_wave], max(as.numeric(invested$wave), na.rm = TRUE) - min(as.numeric(invested$wave), na.rm = TRUE) + 1))
+
+joined_exec = lapply(seq_len(nrow(joined_exec)), function(i) c(joined_exec[i,entry_wave], max(as.numeric(invested$wave), na.rm = TRUE) - min(as.numeric(invested$wave), na.rm = TRUE) + 1))
+```
+
+```{r}
+# Convert into adjacency matrices
+library(igraph)
+
+# Graph from data frame
+current_igraph = graph_from_data_frame(invested[, c("investor", "exec")], directed = TRUE)
+
+# Set the type by assigning the name value that exists in executive investor
+V(current_igraph)$type = V(current_igraph)$name %in% invested$exec
+
+edges_igraph = data.table(ends(current_igraph, seq_len(ecount(current_igraph))))
+
+# Set column names and order it as below:
+colnames(edges_igraph) = c("investor", "exec")
+setkeyv(edges_igraph, c("investor", "exec"))
+
+# .I is an integer vector equal to seq_len(nrow(x)). While grouping, it holds for each item in the group, it's row location in x. This is useful to subset in j 
+edges_igraph[, edge_position := .I]
+
+# Create two columns based on min and max wave value
+invested[, earliest_year := min(wave, na.rm = TRUE), by = c("investor", "exec")]
+invested[, latest_year := max(wave, na.rm = TRUE), by = c("investor", "exec")]
+
+# Find the unique value in these four columns specified
+earliest_years = unique(invested[,c("investor", "exec", "earliest_year", "latest_year")])
+
+# Order the data based on these columns
+setkeyv(earliest_years, c("investor", "exec"))
+
+# Left join
+edges_earliest_year = merge(edges_igraph, earliest_years, all.x = TRUE)
+
+# Set up yearly network by deleting edges that occur after year i
+years = seq(min(as.numeric(invested$wave), na.rm = TRUE), max(as.numeric(invested$wave), na.rm = TRUE))
+
+# Delete edges that are not renewed across year based on 5 year as the baseline
+invested_year = lapply(seq_along(years), function(i) igraph::delete.edges(current_igraph, edges_earliest_year$edge_position[edges_earliest_year$earliest_year > years[i] | years[i] - edges_earliest_year$latest_year > 5]))
+```
+
+Dyadic predictors, based on individual attributes. These objects must be designated as constant, time-invariant dyadic covariates to the nodeSets “senders” and “receivers” using coDyadCovar(). These covariates should be input in the form of a matrix where the rows and columns match those of the adjacency matrix. These covariates will have an “X” for interaction1 in includeEffects()
+```{r}
+# We are looking at only female-female pairs since many of the pairs are male-male
+female = coDyadCovar(as.vector(1 - unique(invested[,c("investor","gender_inv")])$gender_inv) %o% as.vector(1 - unique(invested[,c("exec","gender_exec")])$gender_exec), nodeSets = c("senders", "receivers"))
+
+# Entrepreneur gender, a constant alter covariate indicating an entrepreneurs’ gender
+gender = coDyadCovar(as.vector(unique(invested[,c("investor","gender_inv")])$gender_inv) %o% as.vector(unique(invested[,c("exec","gender_exec")])$gender_exec) + as.vector(1 - unique(invested[,c("investor","gender_inv")])$gender_inv) %o% as.vector(1 - unique(invested[,c("exec","gender_exec")])$gender_exec), nodeSets = c("senders", "receivers"))
+
+# Entrepreneur top school a constant alter covariate indicating whether an entrepreneur earned a degree from a top educational institution, as described in the previous section
+# We want to specifically capture whether both go to ivy plus rather than educational similarity, so just need
+ivyplus = coDyadCovar(as.vector(unique(invested[,c("investor","ivy_plus_investor")])$ivy_plus_investor) %o% as.vector(unique(invested[,c("exec","ivy_plus_exec")])$ivy_plus_exec), nodeSets = c("senders", "receivers"))
+```
+
+```{r}
+# We only care about when values are different for other covariates, so we can offset its value from 1 for each of the pairs and add them together 
+
+# Entrepreneur business skills, a constant alter covariate indicating whether an entrepreneur received an MBA
+mba = coDyadCovar(as.vector(unique(invested[,c("investor","mba_investor")])$mba_investor) %o% as.vector(1 - unique(invested[,c("exec","mba_exec")])$mba_exec) + as.vector(1 - unique(invested[,c("investor","mba_investor")])$mba_investor) %o% as.vector(unique(invested[,c("exec","mba_exec")])$mba_exec), nodeSets = c("senders", "receivers"))
+
+# Entrepreneur technical skills, a constant alter covariate indicating whether an entrepreneur received a technical degree like a PhD or an engineering degree
+phd = coDyadCovar(as.vector(unique(invested[,c("investor","phd_investor")])$phd_investor) %o% as.vector(1 - unique(invested[,c("exec","phd_exec")])$phd_exec) + as.vector(1 - unique(invested[,c("investor","phd_investor")])$phd_investor) %o% as.vector(unique(invested[,c("exec","phd_exec")])$phd_exec), nodeSets = c("senders", "receivers")) 
+
+engineer = coDyadCovar(as.vector(unique(invested[,c("investor","engineer_investor")])$engineer_investor) %o% as.vector(1 - unique(invested[,c("exec","engineer_exec")])$engineer_exec) + as.vector(1 - unique(invested[,c("investor","engineer_investor")])$engineer_investor) %o% as.vector(unique(invested[,c("exec","engineer_exec")])$engineer_exec), nodeSets = c("senders", "receivers"))
+```
+
+```{r}
+# Calculate homophily measures for on managerial or technical skills
+homophily_skills = coDyadCovar(
+	as.vector(unique(invested[,c("investor","engineer_investor")])$engineer_investor) %o% as.vector(unique(invested[,c("exec","engineer_exec")])$engineer_exec)
+	+ as.vector(unique(invested[,c("investor","phd_investor")])$phd_investor) %o% as.vector(unique(invested[,c("exec","phd_exec")])$phd_exec)
+	+ as.vector(unique(invested[,c("investor","mba_investor")])$mba_investor) %o% as.vector(unique(invested[,c("exec","mba_exec")])$mba_exec)
+		, nodeSets = c("senders", "receivers"))
+
+homophily_managerial_skills = coDyadCovar(as.vector(unique(invested[,c("investor","mba_investor")])$mba_investor) %o% as.vector(unique(invested[,c("exec","mba_exec")])$mba_exec), nodeSets = c("senders", "receivers"))
+
+homophily_technical_skills = coDyadCovar(
+	as.vector(unique(invested[,c("investor","engineer_investor")])$engineer_investor) %o% as.vector(unique(invested[,c("exec","engineer_exec")])$engineer_exec)
+	+ as.vector(unique(invested[,c("investor","phd_investor")])$phd_investor) %o% as.vector(unique(invested[,c("exec","phd_exec")])$phd_exec), nodeSets = c("senders", "receivers"))
+```
+
+```{r}
+# Compute complementary skills Codyad
+# Account for having both managerial and technical skills
+
+# MBA investor + PhD/Engineer Investor
+invested[, mba_tech_investor := (mba_investor + phd_investor == 2) | (mba_investor + engineer_investor == 2)]
+
+# MBA Executive + PhD/Engineering Executive
+invested[, mba_tech_exec := (mba_exec + phd_exec == 2) | (mba_exec + engineer_exec == 2)]
+
+# MBA-only Investor
+invested[, mba_only_investor := mba_investor == 1 & phd_investor == 0 & engineer_investor == 0]
+
+# MBA-only Executive
+invested[, mba_only_exec := mba_exec == 1 & phd_exec == 0 & engineer_exec == 0]
+
+# Tech-only Investor
+invested[, tech_only_investor := mba_investor == 0 & (phd_investor == 1 | engineer_investor == 1)]
+
+# Tech-only Executives
+invested[, tech_only_exec := mba_exec == 0 & (mba_exec == 1 | mba_exec == 1)]
+```
+
+```{r}
+# Find 0-to-1 Combinations
+# Note: %o% is the outer product of arrays
+complementarity_skills =	coDyadCovar(
+	as.vector(unique(invested[,c("investor","mba_investor")])$mba_investor) %o% as.vector(1 - unique(invested[,c("exec","mba_exec")])$mba_exec) + as.vector(1 - unique(invested[,c("investor","mba_investor")])$mba_investor) %o% as.vector(unique(invested[,c("exec","mba_exec")])$mba_exec) + as.vector(unique(invested[,c("investor","phd_investor")])$phd_investor) %o% as.vector(1 - unique(invested[,c("exec","phd_exec")])$phd_exec) + as.vector(1 - unique(invested[,c("investor","phd_investor")])$phd_investor) %o% as.vector(unique(invested[,c("exec","phd_exec")])$phd_exec) + as.vector(unique(invested[,c("investor","engineer_investor")])$engineer_investor) %o% as.vector(1 - unique(invested[,c("exec","engineer_exec")])$engineer_exec) + as.vector(1 - unique(invested[,c("investor","engineer_investor")])$engineer_investor) %o% as.vector(unique(invested[,c("exec","engineer_exec")])$engineer_exec) +
+
+# Find 2-to-1 Combinations 
+	as.vector(unique(invested[,c("investor","mba_tech_investor")])$mba_tech_investor) %o% as.vector(unique(invested[,c("exec","tech_only_exec")])$tech_only_exec) + as.vector(unique(invested[,c("investor","mba_tech_investor")])$mba_tech_investor) %o% as.vector(unique(invested[,c("exec","mba_only_exec")])$mba_only_exec) + as.vector(unique(invested[,c("investor","tech_only_investor")])$tech_only_investor) %o% as.vector(unique(invested[,c("exec","mba_tech_exec")])$mba_tech_exec) + as.vector(unique(invested[,c("investor","mba_only_investor")])$mba_only_investor) %o% as.vector(unique(invested[,c("exec","mba_tech_exec")])$mba_tech_exec)  
+	,
+	nodeSets = c("senders", "receivers"))
+
+# Define homophily_both_skill as being consist of investor and MBA-tech investor and executive and MBA-tech executive
+homophily_both_skills = coDyadCovar(as.vector(unique(invested[,c("investor","mba_tech_investor")])$mba_tech_investor) %o% as.vector(unique(invested[,c("exec","mba_tech_exec")])$mba_tech_exec), nodeSets = c("senders", "receivers"))
+
+# We shall also take consideration of age difference between investor and entrepreneur
+age_difference = apply(outer(as.vector(unique(invested[,c("investor","first_year_investor")])$first_year_investor), as.vector(unique(invested[,c("exec","first_year_exec")])$first_year_exec), FUN = "-"), 2, abs)
+
+# We also want to measure age_similarity by subtracting score from max difference
+age_difference = coDyadCovar(max(age_difference) - age_difference, nodeSets = c("senders", "receivers"))
+
+# This covariate can be computed as an outer product, e.g., with outer(), of the investor and entrepreneur race vectors
+# Gender homophily, a constant dyadic covariate indicating whether the investor and entrepreneur share the same gender.
+# This covariate can be computed as an outer product, e.g., with outer(), of the investor and entrepreneur gender vectors.
+nonwhite_ethnicity_match = coDyadCovar(apply(outer(as.vector(unique(invested[,c("investor","race_inv")])$race_inv), as.vector(unique(invested[,c("exec","race_exec")])$race_exec), FUN = "=="), 2, as.numeric), nodeSets = c("senders", "receivers"))
+
+# Reorder the data based on distance in meters
+setorder(invested, date)
+
+# Define coords_inv being unique value of the three columns in the invested data 
+coords_inv = unique(invested[,c("investor","inv_lon", "inv_lat")])
+
+# na.locf0() is a generic function for replacing each NA with the most recent non-NA prior to it.
+coords_inv = unique(coords_inv[, inv_lon := na.locf0(inv_lon, fromLast = TRUE)[1], by = investor][, inv_lat := na.locf0(inv_lat, fromLast = TRUE)[1], by = investor])
+
+# Define coords_exec being unique value of the three columns in the invested data
+coords_exec = unique(invested[,c("exec","comp_lon", "comp_lat")])
+
+# na.locf0() is a generic function for replacing each NA with the most recent non-NA prior to it.
+coords_exec = unique(coords_exec[, comp_lon := na.locf0(comp_lon, fromLast = TRUE)[1], by = exec][, comp_lat := na.locf0(comp_lat, fromLast = TRUE)[1], by = exec])
+
+# Geographic homophily, a constant dyadic covariate indicating the geographic distance between the headquarters of the investor’s investment firm and the headquarters of the entrepreneur’s startup. If individuals have multiple locations, you can use the first location ascribed to them in the data.
+# This covariate can be computed using distm() from the geosphere library, applying fun = distGeo, where the inputs to distm() are the longitude and latitude of the investors’ and entrepreneurs’ headquarters
+dist_meters = matrix(as.numeric(distm(coords_inv[, c("inv_lon", "inv_lat")], coords_exec[,c("comp_lon", "comp_lat")], fun = distGeo))/10^6, nrow = nrow(coords_inv), ncol = nrow(coords_exec))
+
+# We allow dist_meters to be measured as similarity
+dist_meters = coDyadCovar(max(dist_meters) - dist_meters, nodeSets = c("senders", "receivers"))
+
+# Rerder the dataset based on these columns
+setorderv(invested, c("investor", "exec", "date"))
+setorderv(invested, c("investor", "exec", "CompanyId", "date"))
+
+# Define investor_exec_company_round being a sequence of the invested datset grouped by these three columns
+invested[, investor_exec_company_round := seq_len(.N), by = c("investor", "exec", "CompanyId")]
+
+# Define prior_rounds_completed_company being the value of investor_exec_companny_round minus 1
+invested[, prior_rounds_completed_company:= investor_exec_company_round - 1]
+
+# Define prior as follows:
+prior = lapply(seq_along(years)[-length(waves)], function(i) invested[, c("investor", "exec", "prior_investments_success", "prior_investments_nonsuccess", "prior_rounds_completed_company", "wave")])
+
+# Initialize the list
+prior_success = list()
+prior_rounds_completed = list()
+
+# Run a for-loop along prior and compute the following:
+for(i in seq_along(prior)){
+  prior[[i]][wave <= waves[i], prior_success_focal := prior_investments_success]
+  prior[[i]][wave <= waves[i], prior_rounds_completed_focal := prior_rounds_completed_company]
+  prior[[i]][, prior_success_focal := max(prior_success_focal, na.rm = TRUE), by = c("investor", "exec")]
+  prior[[i]][, prior_rounds_completed_focal := prior_rounds_completed_focal[1], by = c("investor", "exec")]
+  prior[[i]][is.infinite(prior_success_focal), prior_success_focal := 0, by = c("investor", "exec")]
+  prior[[i]] = unique(prior[[i]][, c("investor", "exec", "prior_success_focal", "prior_rounds_completed_focal")])
+  prior_success[[i]] = graph_from_data_frame(prior[[i]][,c("investor", "exec", "prior_success_focal")], directed = TRUE)
+  prior_rounds_completed[[i]] = graph_from_data_frame(prior[[i]][,c("investor", "exec", "prior_rounds_completed_focal")], directed = TRUE)
+  V(prior_success[[i]])$type = V(prior_success[[i]])$name %in% invested$exec
+  V(prior_rounds_completed[[i]])$type = V(prior_rounds_completed[[i]])$name %in% invested$exec
+  prior_success[[i]] = get.incidence(prior_success[[i]], attr = "prior_success_focal")
+  prior_rounds_completed[[i]] = get.incidence(prior_rounds_completed[[i]], attr = "prior_rounds_completed_focal")
+}
+
+# Convert into Siena array
+prior_success = varDyadCovar(array(c(
+  prior_success[[1]], prior_success[[2]], prior_success[[3]],
+  prior_success[[4]], prior_success[[5]], prior_success[[6]],
+  prior_success[[7]], prior_success[[8]], prior_success[[9]],
+  prior_success[[10]], prior_success[[11]], prior_success[[12]],
+  prior_success[[13]], prior_success[[14]], prior_success[[15]],
+  prior_success[[16]], prior_success[[17]], prior_success[[18]],
+  prior_success[[19]]
+  ),
+  dim = c(dim(prior_success[[1]]), length(waves) - 1))
+  , nodeSets = c("senders", "receivers")
+)
+
+# Convert into Siena array
+prior_rounds_completed = varDyadCovar(array(c(
+  prior_rounds_completed[[1]], prior_rounds_completed[[2]],
+  prior_rounds_completed[[3]], prior_rounds_completed[[4]],
+  prior_rounds_completed[[5]], prior_rounds_completed[[6]],
+  prior_rounds_completed[[7]], prior_rounds_completed[[8]],
+  prior_rounds_completed[[9]], prior_rounds_completed[[10]],
+  prior_rounds_completed[[11]],prior_rounds_completed[[12]],
+  prior_rounds_completed[[13]],prior_rounds_completed[[14]],
+  prior_rounds_completed[[15]],prior_rounds_completed[[16]],
+  prior_rounds_completed[[17]],prior_rounds_completed[[18]],
+  prior_rounds_completed[[19]]
+  ),
+  dim = c(dim(prior_rounds_completed[[1]]), length(waves) - 1))
+  , nodeSets = c("senders", "receivers")
+)
+
+# Make a covariate object
+nodes_years = data.table(expand.grid(V(current_igraph)$name, years))
+colnames(nodes_years) = c("exec", "wave")
+
+# Set the index
+setkeyv(nodes_years, c("exec", "wave"))
+
+# Reorder the columnn
+setorderv(invested, c("exec", "date"))
+
+# Define these new columns as follows:
+# exec_deal_seq is a number of sequence grouped by two columns
+invested[, exec_deal_seq := .N, by = c("exec", "CompanyId")]
+
+# success_exec is the product of successful ventrue and exec_deal_seq
+invested[, success_exec := successful_venture*(exec_deal_seq == 1)]
+
+# success_exec is a cumulative sum of success_exec
+invested[, success_exec := cumsum(success_exec), by = exec]
+
+# prior_success_exec is a success_exec minus 1
+invested[, prior_success_exec := success_exec - 1, by = exec]
+
+# when prior_success_exec is less than 0, prior_success_exe is zero
+invested[prior_success_exec < 0, prior_success_exec := 0, by = exec]
+
+# prior_distinct_investments_exec is a distinct_investments_exec minus 1
+invested[, prior_distinct_investments_exec := distinct_investments_exec - 1]
+
+# When prior_success_exec is less than 0, prior_success_exec is zero
+invested[prior_success_exec < 0, prior_success_exec := 0]
+
+# prior_success_rate_exeec is the maximum value of prior_success_exec divided by the maximum value of prior_distinct_investment_exec
+invested[, prior_success_rate_exec := max(prior_success_exec)/max(prior_distinct_investments_exec), by = c("exec", "year")]
+
+# When the value of prior_success_rate_exec is NULL, set the value of prior_success_rate_exec as being 0
+invested[is.nan(prior_success_rate_exec), prior_success_rate_exec := 0]
+
+# Set the new value exec_deal_seq as the value from first column
+invested[, exec_deal_seq := exec_deal_seq[1], by = c("exec", "year")]
+
+# Find the unique values of the invested dataset based on these columns
+invested_execs = unique(invested[, c("exec", "wave", "prior_success_exec", "exec_deal_seq")])
+
+# Convert the value of the wave numeric 
+invested_execs[, wave := as.numeric(wave)]
+
+# Set the index
+setkeyv(invested_execs, c("exec", "wave"))
+setkeyv(nodes_years, c("exec", "wave"))
+```
+
+```{r}
+# Inner join these two datset
+nodes_years = merge(invested_execs, nodes_years, all = TRUE)
+
+# define prior_success_exec and exec_deal_seq as imputed missing values of prior_success_exec and exec_deal_seq columns, respectively
+nodes_years[, prior_success_exec := na.locf0(prior_success_exec), by = exec]
+nodes_years[, exec_deal_seq := na.locf0(exec_deal_seq), by = exec]
+
+# When the value of prior_succes_exec and exec_deal_seq is NULL, set their respective value to zero
+nodes_years[is.na(prior_success_exec), prior_success_exec := 0]
+nodes_years[is.na(exec_deal_seq), exec_deal_seq := 0]
+
+# Convert the data type to numeric
+nodes_years[, wave := as.numeric(wave)]
+nodes_years[, prior_success_exec := as.numeric(prior_success_exec)]
+nodes_years[, exec_deal_seq := as.numeric(exec_deal_seq)]
+
+# Convert the nodes_year to long data format
+node_characteristics = reshape(nodes_years, idvar="exec", timevar="wave", direction="wide")
+
+# Sort the node_characteristics based on order of nodes 
+node_characteristics = node_characteristics[order(match(node_characteristics$exec, V(current_igraph)$name)),]
+
+# Define a variable ''exits' as being the value of the node-characteristics that contains information about prior_success_exec and exec_deal_seq
+exits = data.table(id = node_characteristics$exec, node_characteristics[,grepl("^prior_success_exec", colnames(node_characteristics)), with = FALSE])
+
+rounds = data.table(id = node_characteristics$exec, node_characteristics[,grepl("^exec_deal_seq", colnames(node_characteristics)), with = FALSE])
+
+# Reorder the column
+setorderv(invested, c("investor", "date"))
+
+# Define first_city_inv and first_state_inv as the first value of the City and State, respectively
+invested[, first_city_inv := City.x[1], by = investor]
+invested[, first_state_inv := State.x[1], by = investor]
+
+# Reorder the column
+setorderv(invested, c("exec", "date"))
+invested[, first_city_exec := City.y[1], by = exec]
+invested[, first_state_exec := State.y[1], by = exec]
+
+# Define constant covariates of the investor
+constant_covar_inv = unique(invested[investor %in% V(current_igraph)$name, c("investor", "Gender.x", "mba_investor", "phd_investor", "finance_investor", "engineer_investor", "ivy_plus_investor", "race_inv", "first_year_investor", "first_city_inv", "first_state_inv")])
+
+# Define constant covariates of the executive
+constant_covar_exec = unique(invested[exec %in% V(current_igraph)$name, c("exec", "Gender.y", "mba_exec", "phd_exec", "finance_exec", "engineer_exec", "ivy_plus_exec", "race_exec", "first_year_exec", "first_city_exec", "first_state_exec")])
+
+# Reorder constant_covar_inv based on the vertices
+constant_covar_inv = constant_covar_inv[order(match(constant_covar_inv$investor,  V(current_igraph)[V(current_igraph)$type == 0]$name)),]
+
+# Reorder constant_covar_exec based on the vertices
+constant_covar_exec = constant_covar_exec[order(match(constant_covar_exec$exec,  V(current_igraph)[V(current_igraph)$type == 1]$name)),]
+
+# Define female_exec as follows:
+female_exec = coCovar(as.numeric(constant_covar_exec$Gender.y == "Female"), nodeSet = "receivers")
+
+# Define ivyplus_exec as follows:
+ivyplus_exec = coCovar(as.numeric(constant_covar_exec$ivy_plus_exec), nodeSet = "receivers")
+
+# Define tech_hub_exec as follows:
+tech_hub_exec = coCovar(as.numeric(constant_covar_exec$first_city_exec == "San Francisco" | constant_covar_exec$first_city_exec == "New York" | constant_covar_exec$first_city_exec == "Boston" | constant_covar_exec$first_city_exec == "Menlo Park" | constant_covar_exec$first_city_exec == "Palo Alto" | constant_covar_exec$first_city_exec == "Cambridge" | constant_covar_exec$first_city_exec == "Chicago" | constant_covar_exec$first_city_exec == "Los Angeles" | constant_covar_exec$first_city_exec == "Seattle" | constant_covar_exec$first_city_exec == "Chevy Chase"), nodeSet = "receivers")
+
+# Define mba_exec as follows:
+mba_exec = coCovar(as.numeric(constant_covar_exec$mba_exec), nodeSet = "receivers")
+
+# Define technical_exec as follows:
+technical_exec = coCovar(as.numeric(constant_covar_exec$phd_exec + constant_covar_exec$engineer_exec > 0), nodeSet = "receivers")
+
+# Define cali_inv as follows:
+cali_inv = coCovar(as.numeric(constant_covar_inv$first_state_inv != "California"), nodeSet = "senders")
+cali_exec = coCovar(as.numeric(constant_covar_exec$first_state_exec != "California"), nodeSet = "receivers")
+
+# Define ethnicity_inv and ethnicity_exec as follows:
+ethnicity_inv = coCovar(as.numeric(as.factor(constant_covar_inv$race_inv)), nodeSet = "senders")
+ethnicity_exec = coCovar(as.numeric(as.factor(constant_covar_exec$race_exec)), nodeSet = "receivers")
+
+# Define first_year_inv and first_year_exec as follows:
+first_year_inv = coCovar(constant_covar_inv$first_year_investor, nodeSet = "senders")
+first_year_exec = coCovar(constant_covar_exec$first_year_exec, nodeSet = "receivers")
+
+# Define ivyplus_inv as follows:
+ivyplus_inv = coCovar(as.numeric(constant_covar_inv$ivy_plus_investor), nodeSet = "senders")
+
+# Define city_inv and city_exec as follows:
+city_inv = coCovar(as.numeric(as.factor(constant_covar_inv$first_city_inv)), nodeSet = "senders")
+city_exec = coCovar(as.numeric(as.factor(constant_covar_exec$first_city_exec)), nodeSet = "receivers")
+```
+
+```{r}
+# Now set up the list
+investments = list(
+  get.incidence(invested_year[[1]], sparse = FALSE),
+  get.incidence(invested_year[[2]], sparse = FALSE),
+  get.incidence(invested_year[[3]], sparse = FALSE),
+  get.incidence(invested_year[[4]], sparse = FALSE),
+  get.incidence(invested_year[[5]], sparse = FALSE),
+  get.incidence(invested_year[[6]], sparse = FALSE),
+  get.incidence(invested_year[[7]], sparse = FALSE),
+  get.incidence(invested_year[[8]], sparse = FALSE),
+  get.incidence(invested_year[[9]], sparse = FALSE),
+  get.incidence(invested_year[[10]], sparse = FALSE),
+  get.incidence(invested_year[[11]], sparse = FALSE),
+  get.incidence(invested_year[[12]], sparse = FALSE),
+  get.incidence(invested_year[[13]], sparse = FALSE),
+  get.incidence(invested_year[[14]], sparse = FALSE),
+  get.incidence(invested_year[[15]], sparse = FALSE),
+  get.incidence(invested_year[[16]], sparse = FALSE),
+  get.incidence(invested_year[[17]], sparse = FALSE),
+  get.incidence(invested_year[[18]], sparse = FALSE),
+  get.incidence(invested_year[[19]], sparse = FALSE),
+  get.incidence(invested_year[[20]], sparse = FALSE)
+  )
+for(i in seq_along(investments)){
+  investments[[i]][investments[[i]] > 1] = 1
+}
+
+# Convert it to a triple array
+investments = sienaDependent(array(c(
+  investments[[1]],investments[[2]],investments[[3]],
+  investments[[4]],investments[[5]],investments[[6]],
+  investments[[7]],investments[[8]],investments[[9]],
+  investments[[10]],investments[[11]],investments[[12]],
+  investments[[13]],investments[[14]],investments[[15]],
+  investments[[16]],investments[[17]],investments[[18]],
+  investments[[19]],investments[[20]]
+  ),
+  dim = c(dim(investments[[1]]), length(waves))),
+  "bipartite", nodeSet = c("senders", "receivers")
+)
+
+# Creates a Siena node set which can be used as the nodes in a siena network
+senders = sienaNodeSet(length(unique(invested$investor)), nodeSetName = "senders")
+receivers = sienaNodeSet(length(unique(invested$exec)), nodeSetName = "receivers")
+
+# The SIENA model will want also want to take account of when people join and leave the network. To do this, incorporate using sienaCompositionChange() the period, e.g., 1, 2, or 3, corresponding to the first, second, and third year, each investor and entrepreneur enters the dataset
+# Consider the first, second, and third year, each investor and entrepreneur enters the dataset. The function sienaCompositionChange() takes a list where each element is a vector of length two that takes in the first position the period it enters the data and in the second position the last period in the data
+# including the join times
+joined_investors = sienaCompositionChange(joined_investors, nodeSet = "senders")
+joined_exec = sienaCompositionChange(joined_exec, nodeSet = "receivers")
+
+# Define prior_success_exec and round_exec as follows:
+prior_successes_exec = varCovar(as.matrix(exits[id %in% invested$exec, -c("id")]), nodeSet="receivers")
+round_exec = varCovar(as.matrix(rounds[id %in% invested$exec, -c("id")]), nodeSet="receivers")
+
+# Set up Siena data
+siena_data = sienaDataCreate(
+	investments,prior_success,prior_rounds_completed,
+	gender,female,ivyplus,complementarity_skills,
+	dist_meters,nonwhite_ethnicity_match,age_difference,
+	gender_exec,ivyplus_exec,nonwhite_exec,female_exec,
+	ethnicity_exec,first_year_inv,first_year_exec,tech_hub_exec,
+	prior_successes_exec,round_exec,mba_exec,technical_exec,
+	joined_investors,joined_exec,nodeSets = list(senders, receivers))
+
+# Call for a dafault effects
+siena_effects = getEffects(siena_data)
+siena_effects
+```
+
+```{r}
+# Here, we want to measuring network homophily using includeEffects()
+# cycle4 is a measure of closure in bipartite networks that captures network homophily
+siena_effects = includeEffects(siena_effects, cycle4)
+
+# Measuring personal homophily 
+siena_effects = includeEffects(siena_effects, X, interaction1 = "nonwhite_ethnicity_match")
+siena_effects = includeEffects(siena_effects, X, interaction1 = "gender") 
+siena_effects = includeEffects(siena_effects, X, interaction1 = "ivyplus")
+siena_effects = includeEffects(siena_effects, X, interaction1 = "dist_meters")
+siena_effects = includeEffects(siena_effects, X, interaction1 = "age_difference")
+
+# Complementary skills, a constant dyadic covariate indicating whether one member of the dyad has a technical degree, such as an engineering degree or a PhD, and the other member of the dyad has a business degree, such as an MBA — part of the rationale for venture capital to entrepreneur matching is that investors can pair their business acumen with the technical skills of innovative entrepreneurs
+# This covariate can be computed as an outer product of a logical vector for investors and entrepreneurs indicating whether they earned one of these types of degrees and another logical vector indicating that they did not earn one of these types of degrees 
+siena_effects = includeEffects(siena_effects, X, interaction1 = "complementarity_skills")
+
+# Experience homophily, a constant dyadic covariate indicating the similarity in years of experience of the investor and entrepreneur. Experience can be measured as the number of years since the investor’s first investment or the entrepreneur’s first venture received funding
+# This covariate can be computed as an outer product of the difference between the first year of investment or venture founding for each individual, and each individual difference can be subtracted from the maximum difference to turn this into a similarity
+siena_effects = includeEffects(siena_effects, X, interaction1 = "prior_success", fix = TRUE)
+siena_effects[which(siena_effects$functionName == "Sum of ties x prior_success"),14] = -5
+
+# network structure
+# outActSqrt, a measure of the dispersion in investors’ outdegrees that captures whether investors who fund many entrepreneurs’ ventures tend to be more likely to do so going forward
+siena_effects = includeEffects(siena_effects, outActSqrt)
+
+# inPopSqrt, a measure of the dispersion in entrepreneurs’ indegrees that captures whether entrepreneurs who are funded by many investors tend to be more likely to receive funding opportunities by more investors going forward
+siena_effects = includeEffects(siena_effects, inPopSqrt)
+
+# outInAss, a measure of assortativity, or the correlation of indegrees and outdegrees, that captures whether investors who fund many entrepreneurs’ ventures tend to associate with entrepreneurs who receive many funding opportunities from investors
+siena_effects = includeEffects(siena_effects, outInAss)
+
+# Measure the personal characteristics of investors based on their executive types
+siena_effects = includeEffects(siena_effects, altX, interaction1 = "nonwhite_exec")
+siena_effects = includeEffects(siena_effects, altX, interaction1 = "gender_exec")
+siena_effects = includeEffects(siena_effects, altX, interaction1 = "ivyplus_exec")
+siena_effects = includeEffects(siena_effects, altX, interaction1 = "tech_hub_exec")
+siena_effects = includeEffects(siena_effects, altX, interaction1 = "first_year_exec")
+siena_effects = includeEffects(siena_effects, altX, interaction1 = "mba_exec")
+siena_effects = includeEffects(siena_effects, altX, interaction1 = "technical_exec")
+siena_effects = includeEffects(siena_effects, altX, interaction1 = "round_exec")
+
+# Per instruction, we can set diagonalize = 0.2 to incorporate neighbor effects but also make computations efficient.
+siena_algorithm =  sienaAlgorithmCreate(useStdInits = FALSE, projname = "investment_decisions", diagonalize = 0.2)
+
+# Run Siena model to get results
+rm(list = setdiff(ls(all = TRUE), c("siena_data", "siena_effects", "siena_algorithm")))
+siena_effects
+
+# Here, we are running while-loop to see if any ratio is greater than abs(.1)
+i = 1
+while(sum(abs(siena_result$tconv) > .1) > 0){ 
+  siena_result = siena07(siena_algorithm, data=siena_data, effects=siena_effects, prevAns=siena_result) # Rerun models using previous data
+  i = i + 1
+siena_result = siena07(siena_algorithm, data = siena_data, effects = siena_effects, nbrNodes = 46, useCluster = TRUE, initC = TRUE, prevAns=siena_result)
+}
+
+# Use rbindlist to coerce it appropriately
+rbindlist(lapply(seq_along(siena_result$effects$effectName), function(i) data.table(
+  variable = siena_result$effects$effectName[i],
+  estimate = siena_result$theta[i],
+  std_err = siena_result$se[i],
+  tstat = siena_result$theta[i] /sqrt(siena_result $covtheta[i,i]),
+  pvalue_t = (1 - pnorm(abs(siena_result$theta[i] /sqrt(siena_result $covtheta[i,i])), 0, 1)) * 2,
+  t(unlist(Multipar.RSiena(siena_result, i))),
+  tconv = siena_result$tconv[i])))
+```
+
+# Extra credit
+```{r}
+# Read in the processed data file as an early Christmas Break for us 
+outcomes = fread("individual_investor_outcomes.csv", head = TRUE)
+
+# Use a regression model from the survival package
+library(survival)
+
+### Part AI - Do investors benefit?
+# Assumption: A firm can only go out of business once, and its likelihood of such happening is related to their years of operation (thus, we can use the set of 'survival' model to estimate the likelihood of 'failure')
+
+# We can use a discrete-time model using logistic function that evaluates whether going out of business, controlling for the tenure-specific rate of failure for any firm that has been in operation for a tenure of x years--here, tenure is given by the variables inv_age or inv_seq which measure tenure in years either counting from 0 or from 1, respectively
+
+# Now, we can predict whether the firm goes out of business based on the homophily of investment decisions reflected in its local network. Going out of business is represented by the variable “out_of_business” being equal to 1
+# Include as predictors in the model the dyadic and entrepreneur attributes from the SIENA model
+# the scaled number of 4-cycles, given by “l4c_scaled”
+# gender homophily, given by “gender”
+# ethnic homophily, given by “ethnicity”
+# age homophily, given by “age_diff”
+# geographic homophily, given by “geo_dist”
+# top school homophily, given by “ivyplus”
+# complementary skills, given by “complementarity”
+# entrepreneur gender, given by “male_exec”
+# entrepreneur ethnic minority, given by “nonwhite_exec”
+# entrepreneur top school, given by “ivyplus_exec”
+# Also include as controls the investor longitude and latitude and the year as a linear control.
+summary(glm(out_of_business ~ l4c_scaled + 
+              gender + 
+              ethnicity + 
+              age_diff + 
+              geo_dist + 
+              ivyplus + 
+              complementarity + 
+              male_exec + 
+              nonwhite_exec + 
+              ivyplus_exec + 
+              year + 
+              factor(inv_seq), 
+            data = outcomes, 
+            family = "binomial")) # It suggests that network homophily and ivy plus school homophily are related to not going out of business. anti-homophily in experience (age_diff) is related to not going out of business, and complementarity in skills is related to not going out of business
+```
+
+```{r}
+### Part AII - Does investing based on homophily help investors avoid going out of business?
+sd(outcomes$successful_investments, na.rm = TRUE) > mean(outcomes$successful_investments, na.rm = TRUE) # Returns TRUE (SD is bigger than Mean)
+
+# We can use glm.nb() from MASS to account for overdispersion while using rq.counts() from Qtools to account forskewness in the 'successful_investments' variable 
+summary(MASS::glm.nb(successful_investments ~ l4c_scaled + 
+                       gender + 
+                       ethnicity + 
+                       age_diff + 
+                       geo_dist + 
+                       ivyplus + 
+                       complementarity + 
+                       male_exec + 
+                       nonwhite_exec + 
+                       ivyplus_exec + 
+                       year + 
+                       factor(inv_seq), 
+                     data = outcomes)) # Does investing based on homophily help investors achieve more successful investments? -> It suggests that network homophily, gender, ethnicity, and geographic homophily are related to higher likelihood of making more successful investments. We can also infer that anti-homophily in experience (age_diff) is related to more positive outcomes, while ivy plus homophily is associated with worse outcomes here. In summary, it is the case-by-case.
+```
+
+```{r}
+### Part B - Do startups and their entrepreneurs benefit?
+
+# Read in the startup states data file
+states = fread("startup_states.csv", head = TRUE)
+
+# Set startup as the reference category by arranging alphabetically
+company_states = c("Startup", unique(states[company_state != "" & company_state != "Startup"]$company_state))
+
+# get startup as #1
+states_facs = paste0(seq(1:6),":",c("Startup", unique(states[company_state != "" & company_state != "Startup"]$company_state)))
+
+# Set up factor
+for(i in seq_along(unique(states$company_state))){
+	states[company_state == company_states[i], state_factor := states_facs[i]]
+}
+
+# It is also possible to use regression to predict categorical outcomes as well. We will use a “multinomial logit” to predict the likelihood of a startup being in any particular state operation 
+# We can start by setting up the multinomial logit using the command multinom from the “nnet” package. Include in the model the same predictors and controls as above
+startup_model = nnet::multinom(state_factor ~ 
+                          l4c_scaled + 
+                          gender + 
+                          ethnicity + 
+                          age_diff + 
+                          geo_dist + 
+                          ivyplus + 
+                          complementarity + 
+                          male_exec + 
+                          nonwhite_exec + 
+                          ivyplus_exec + 
+                          year, 
+                          data = states[company_state != ""])
+
+# This command does not estimate p-values for statistical significance on its own, so instead these can be estimated by computing the z-scores of the coefficients:
+zscore = summary(startup_model)$coefficients/summary(startup_model)$standard.errors
+
+# Conduct the significance test:
+(1 - pnorm(abs(zscore), 0, 1)) * 2
+
+# Does investing based on homophily help entrepreneurs’ ventures achieve better outcomes such as Exit or Profitable? What does it seem to suggest about how failing fast through homophily influences the trajectory of a startup?
+# Answer -> We can infer that network and other homophily measures makes it more probable to move up to serial entrepreneurship because investors usually use homophily as a measure to navigate more quickly in search for very successful long-term investments, and this suggests that the process may help investors who may not be as good as entrepreneurs who values individual attention and effort in the establishment of their particular venture
+```
+
+```{r}
+### Part C - Do industries benefit?
+
+# Run one regression illustrating if different levels of each kind of homophily in the prior year are related to the proportion of entrepreneurs with technical skills, given by the variable “technical_exec”, that remain in the industry, and another relating homophily in the prior year to business skills, proxied by the variable “mba_exec” 
+summary(glm(technical_exec ~ male_exec + 
+                             mba_exec + 
+                             l4c_scaled + 
+                             gender + 
+                             ethnicity + 
+                             age_diff + 
+                             geo_dist + 
+                             ivyplus + 
+                             complementarity +
+                             nonwhite_exec + 
+                             ivyplus_exec + 
+                             year
+                             data = outcomes, 
+                             family = quasibinomial(link = "logit"))) # We can infer that technical aptitude is somewhat related to the likelihood of going out of the business. The more educated executives are, the less likely that their ventures run out of the business
+```

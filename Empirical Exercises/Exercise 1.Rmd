@@ -1,0 +1,551 @@
+---
+title: "Empirical_Exercise_#1_Sean_Jung"
+author: "Sean Jung"
+date: "10/30/2020"
+output: html_document
+---
+
+## Package/Datset Import and Data Exploration/Preparation/Manipulation
+```{r setup, include=TRUE}
+# Start by importing igraph and data.table
+library(igraph)
+library(data.table)
+
+# Set working directory to my local directory
+setwd("C:/Users/seanj/Desktop/Social Network Analytics/HW1")
+
+########### Data preparation steps
+
+# Import the file
+edges = fread("social_and_task_network.csv", head = TRUE)
+edges # four columns: ego, alter, social_tie, task_tie
+
+# Check the type
+typeof(edges$ego) # integer
+typeof(edges$alter) # integer
+typeof(edges$social_tie) # double
+typeof(edges$task_tie) # double
+
+# Eliminate all the zeroes to make the network of existing ties:
+edges = edges[social_tie > 0 | task_tie > 0]
+edges # now all the social_tie and task_tie contains the value greater than 0
+
+# Build a graph object by using graph.data.frame function
+# We are now reading in the data to igraph
+complete_network = graph.data.frame(edges)
+typeof(complete_network) # list
+complete_network  
+# name (v/c), social_tie (e/n), task_tie (e/n)
+# edges from 92e0756
+
+# Plot the complete network
+plot(complete_network, 
+     layout=layout.fruchterman.reingold, 
+     edge.arrow.size=0.5)
+title("Complete Network")
+
+# We can further split up the networks into social and task ties by removing lines
+# I removed edges where there is no social tie ("social_tie" = 0)
+social_network = delete.edges(complete_network, 
+                              E(complete_network)[get.edge.attribute(complete_network,
+                                                                 name = "social_tie")==0])
+
+# Check the social ties
+social_network # social_tie (e/n), task_tie (e/n)
+
+# Plot the Social Network
+plot(social_network, 
+     layout=layout.fruchterman.reingold, 
+     edge.arrow.size=0.5)
+title("Social Network")
+
+
+# Similarly, remove edges where there is no task tie ("task_tie" = 0)
+task_network = delete.edges(complete_network, 
+                            E(complete_network)[get.edge.attribute(complete_network,
+                                                                   name = "task_tie")==0])
+
+task_network # social_tie(e/n), task_tie (e/n)
+
+
+# Plot the Task Network
+plot(task_network, 
+     layout=layout.fruchterman.reingold, 
+     edge.arrow.size=.5)
+title("Task Network")
+
+# Here, we are deleting vertices on the points where degree of either social or task network is zero. 
+# We perform this step because calculating centrality measures requires us to first get rid of isolates, which have degree of 0
+
+# Delete vertices on social network
+social_network = delete.vertices(social_network, 
+                                 V(social_network)[degree(social_network)==0])
+
+# Plot the Social Network again
+plot(social_network, 
+     layout=layout.fruchterman.reingold, 
+     edge.arrow.size=0.5)
+title("Social Network")
+
+
+# Delete vertices on task network
+task_network = delete.vertices(task_network, 
+                               V(task_network)[degree(task_network)==0])
+
+# Plot the Task Network again
+plot(task_network, 
+     layout=layout.fruchterman.reingold, 
+     edge.arrow.size=.5)
+title("Task Network")
+
+```
+
+## Question 1 - Part A
+```{r cars}
+
+# Use igraph to generate in-degree, out-degree, closeness, betweenness, and PageRank centrality statistics for each individual the social and task networks
+
+# We can compose a function to get all of the network stats at once and put theme into a tabular format
+CalStat =function(network)
+{
+  in_degree = degree(network, mode = "in")
+  out_degree = degree(network, mode = "out")
+  closeness = closeness(network, mode = "total")
+  betweenness = betweenness(network)
+  page_rank = page_rank(network)$vector # page_rank creates a list object, and we just want the actual scores, which are contained in the "vector"
+  id=V(network)$name
+  stats= as.data.table(list(id = id, 
+                            in_degree = in_degree, # In-degree
+                            out_degree = out_degree, # Out-degree
+                            closeness = closeness, # Closeness
+                            betweenness = betweenness, # Betweenness
+                            page_rank = page_rank)) # PageRank
+  return(stats)
+} # we have to put them into the data.table format to do anaylsis
+
+# Here, we are calculating statistics of the social network
+social_stat = CalStat(social_network)
+social_stat
+
+# Here, we are calculating statistics of the task network
+task_stat = CalStat(task_network)
+task_stat
+
+# We are drawing the plot of each network to visualize and get a good understanding of what each networks look like
+
+# plot social network
+plot(social_network, 
+     vertex.size=20, 
+     vertex.label=V(social_network)$name, 
+     edge.arrow.size = 0.5, 
+     layout=layout.fruchterman.reingold,
+     main='Social Network')
+
+# plot task network
+plot(task_network, 
+     vertex.size=20, 
+     vertex.label=V(task_network)$name, 
+     edge.arrow.size = 0.5, 
+     layout=layout.fruchterman.reingold,
+     main='Task Network')
+```
+
+## Question 1 - Part B
+
+Correlation matrix for Betweenness centrality is very high across the different measures except for the closeness centrality, indicating that those who serves as important role in task network is also likely to serve as bridges for the social issues. 
+
+It is also noticeable that high score in in-degree and out-degree centrality is closely related to the higher score in betweenness centrality score.
+```{r pressure, echo=FALSE}
+# Compute the correlations of the five centrality measures you generate for the social network with the five measures generated for the task network. 
+# Which measures in the task network are most closely related to those in the socializing network? 
+# Name at least one insight can you draw from the relationships between these five measures across the two networks.
+
+# cor(social_stat, task_stat) generates error code because x must be numeric
+
+# Here, we are calculating pairwise correlation by computing the correlations based only on the data that are already existing in both graphs; this will help us to see how each centrality are correlated together
+
+social_stat[which(social_stat$id %in% task_stat$id)]
+task_stat[which(task_stat$id %in% social_stat$id)]
+
+# We are only selecting 2 to 6 columns because we don't need to include 1 column, which is id column (doesn't tell anything useful by itself)
+cor(social_stat[which(social_stat$id %in% task_stat$id),2:6], 
+    task_stat[which(task_stat$id %in% social_stat$id),2:6])
+```
+
+## Question 2 - Part A
+```{r}
+############## Question 2 - Part A
+
+# Next, consider the social and task ties together, as two distinct types of ties comprising one network. 
+# (A) Suppose that a tie is strong if it is above the mean strength for that type, conditional on the tie existing-do not include weights of 0 in the calculation of the mean. Under this definition, does the network satisfy Strong Triadic Closure?  
+# Come up with a solution that illustrates this 
+  # (1) visually, in a plot, as well as 
+  # (2) programmatically, by giving the number or proportion of ties that are violation of Strong Triadic Closure
+
+# Here, we are assigning two new variables based on criteria that tie is strong if it is above the mean strength for that type while excluding weights of 0 in the calculation of the mean
+strong_social = edges$social_tie > mean(edges$social_tie[edges$social_tie > 0])
+strong_task = edges$task_tie > mean(edges$task_tie[edges$task_tie > 0])
+
+# Then, we are setting edge attribute to our existing network by including only the strong ties from either social or task network
+# https://igraph.org/r/doc/set_edge_attr.html
+complete_network = set_edge_attr(complete_network, 
+                                 "strong", 
+                                 index = E(complete_network), 
+                                 strong_social == TRUE | strong_task == TRUE)
+
+# set the color of the edges using the "strong" edge attribute
+E(complete_network)$color = c("red", "blue")[as.factor(E(complete_network)$strong)] # red is weak tie; while blue is strong tie
+
+# [Visualization] We are plotting the network to check for strong triadic closure. 
+plot(complete_network,
+     vertex.label=V(complete_network)$name,
+     layout=layout.fruchterman.reingold, 
+     vertex.label.color="blue",
+     vertex.size = 30, 
+     edge.arrow.size=0.2,
+     edge.curved=FALSE,
+     main = "Full Network [Mean]")
+# Graph doesn't appear to exhibit strong triadic closure as there is not enough blue (strong) ties
+
+
+# Programmatic solution
+# Here, We can compute the number of ties that are in violation of Strong Triadic Closure. Here, we are just getting the edge list of 'ego' and 'alter' based on the presence of strong ties in either social network or task network
+complete_network_strong = edges[strong_social == TRUE | strong_task == TRUE, 
+                                c("ego", "alter")]
+
+complete_network_strong
+
+# Check the type
+typeof(complete_network_strong) # list
+
+# Plot a scatter plot to check the correlation between alter and ego
+plot(complete_network_strong, main = "Complete Network Strong") # moderate correlation
+
+# Check the correlation between ego and alter
+cor(complete_network_strong$ego, complete_network_strong$alter) # 0.311
+
+
+# It is important to only calculate only the potential triples in which at least two of the three ties are considered strong as that is the criteria that needs to be fulfilled to form a strong triadic closure
+# To do that, we should check for a strong tie on the edgelist and get these distinct edges
+
+# This method combines two nodes interconnected to give all the possible combination
+complete_network_strong = rbindlist(list(complete_network_strong[, c("ego","alter")], complete_network_strong[, c("alter", "ego")]), use.names = FALSE)
+
+# And we can use unique() function to remove duplicates
+complete_network_strong = unique(complete_network_strong)
+
+# Here, we are using data.table[i, j, by] syntax to split 'complete_network_strong' into separate chunks in a list for each ego, so that each chunks can have different size
+# Chunks with at least two rows represents two strong ties leaving a node, and we can retrieve them by storing them in at_least_two variable that filters the result when each row (.N) is bigger than 1
+complete_network_strong[, at_least_two := .N > 1, by = ego]
+# https://cran.r-project.org/web/packages/data.table/vignettes/datatable-intro.html 
+# .N is a special variable that holds the number of rows in the current group. 
+# Grouping by ego obtains the number of rows, .N, for each group.
+# Here, we are creating a new column called 'at_least_two'
+
+# filter the columns where 'at_least_two' is TRUE
+complete_network_strong = complete_network_strong[at_least_two==TRUE]
+
+# split into different groups by different value of ego
+complete_network_strong = split(complete_network_strong, by = "ego")
+
+# See complete_network_strong
+complete_network_strong
+
+# We get potential connection of connection that would be implied by triadic closure
+# Here, we are applying the comb function in transposed manner to perform rbind function later along the each sequence of complete_network_strong to get all the potential pairs of people that ego is connected to
+# seq_along(complete_network_strong) # returns numbers from 1 to 8
+# t(combn(complete_network_strong[[1]]$alter, 2)) 
+# t(combn(complete_network_strong[[2]]$alter, 2))
+# t(combn(complete_network_strong[[3]]$alter, 2)) 
+# t(combn(complete_network_strong[[4]]$alter, 2)) 
+# t(combn(complete_network_strong[[5]]$alter, 2)) 
+# t(combn(complete_network_strong[[6]]$alter, 2)) 
+# t(combn(complete_network_strong[[7]]$alter, 2)) 
+# t(combn(complete_network_strong[[8]]$alter, 2)) 
+
+# By using lapply function, we can combine all these lists above into one giant list that contains information about potnetial pairs of people that ego is connected to
+strong_triadic_closure = lapply(seq_along(complete_network_strong), 
+                                function(i) t(combn(complete_network_strong[[i]]$alter, 2)))
+
+# Check strong_triadic_closure
+strong_triadic_closure
+
+# 'unique(strong_triadic_closure)' returns unique value, but it doesn't return one single data frame that contains all info
+
+# By using rbind argument on do.call() function, we can create a data frame from a list where the columns of each list element represent the variables with the same value
+strong_triadic_closure = unique(do.call(rbind, strong_triadic_closure))
+
+# Check strong_triadic_closure
+strong_triadic_closure
+
+# We want to combine two list together
+ego_alter = edges[,c("ego", "alter")]
+alter_ego = edges[,c("alter", "ego")]
+
+# Here, we are creating list of undirected edges
+real_edges = rbindlist(list(ego_alter, alter_ego),
+                       use.names = FALSE)
+
+# Here we are scanning all the potential triads closed to ones that actually are closed in the real data
+# stc = strong triadic closure
+# Here, we are combining first column and second column of the strong_triadic_closure element-wise separated by comma
+stc_c1 = strong_triadic_closure[,1]
+stc_c2 = strong_triadic_closure[,2]
+
+# strong_triadic_closure[,2]
+stc = paste(stc_c1, stc_c2, sep=",")
+stc
+
+# Here, we are combining first column and second column of the real_edges element-wise separated by comma
+real_ego = real_edges$ego
+real_alter = real_edges$alter
+real = paste(real_ego, real_alter, sep=",")
+real
+
+# Returns list of Boolean that returns TRUE if a value of stc is also in real and FALSE otherwise
+stc %in% real
+
+# This computation returns which triples with two strong ties are closed
+stc[(stc %in% real)]
+
+# This computation returns which triples with two strong ties aren't closed
+stc[!(stc %in% real)]
+
+# This calculation shows what proportion of strong triadic closure is  realized
+mean(stc %in% real) # about 51.4 percent
+
+# This calculation shows what proportion of strong triadic closure is not realized
+1 - mean(stc %in% real) # about 48.6 percent
+
+```
+
+## Question 2 - Part B
+```{r}
+############## Question 2 - Part B
+
+# Here, we are performing the same steps as we did in Part A but this time using median as a criteria to determine the presence strong tie
+social_strong = edges$social_tie > quantile(edges$social_tie[edges$social_tie > 0], .5)
+task_strong = edges$task_tie > quantile(edges$task_tie[edges$task_tie > 0], .5)
+
+# Then, we set the edge attribute based on these strong ties we assigned in the previous step
+complete_network = set_edge_attr(complete_network, "strong", 
+                             index = E(complete_network), 
+                             social_strong == TRUE | task_strong == TRUE)
+
+E(complete_network)$color = c("red", "blue")[as.factor(E(complete_network)$strong)]
+
+# plot the igraph
+plot.igraph(complete_network,
+            vertex.label=V(complete_network)$name,
+            layout=layout.fruchterman.reingold, 
+            vertex.label.color="black",
+            vertex.size = 25, 
+            edge.arrow.size=.3,
+            edge.curved=FALSE,
+            main = "Full Network [Median]") # We don't see strong triadic closure either
+
+# repeat the programmatic approach
+social_strong = edges$social_tie > quantile(edges$task_tie[edges$task_tie > 0], .5)
+task_strong = edges$task_tie > quantile(edges$task_tie[edges$task_tie > 0], .5)
+complete_network_strong = edges[social_strong == TRUE | task_strong == TRUE, 1:2]
+
+complete_network_strong # 41 rows of ego and alter columns
+
+# We can check for a strong tie existing both directions on the edgelist, and get the distinct edges
+# We can use data.table because it helps us avoiding the necessity to define separate column names during rbind 
+# We don't need to call to first item because it is a data frame
+complete_network_strong = rbindlist(list(complete_network_strong, 
+                                     data.table(cbind(complete_network_strong$alter,
+                                                      complete_network_strong$ego))))
+complete_network_strong = unique(complete_network_strong)
+
+complete_network_strong
+
+# Here we split into chunks in a list for each ego so the chunks can vary in size
+# We only care about chunks with at least two rows
+complete_network_strong[, at_least_two := .N > 1, by = ego]
+complete_network_strong = complete_network_strong[at_least_two==TRUE]
+complete_network_strong = split(complete_network_strong, by = "ego")
+
+# We get potential friends of friends that would be implied by triadic closure
+# Here, we are applying the comb function in transposed manner to perform rbind function later along the each sequence of complete_network_strong to get all the potential pairs of people that ego is connected to
+strong_triadic_closure = lapply(seq_along(complete_network_strong),
+                                function(i) t(combn(complete_network_strong[[i]]$alter, 2)))
+
+strong_triadic_closure # 48 unique rows of ego and alter columns
+
+# By using rbind argument on do.call() function, we can create a data frame from a list where the columns of each list element represent the variables with the same value
+strong_triadic_closure = unique(do.call(rbind, strong_triadic_closure))
+strong_triadic_closure
+
+# In order to satisfy strong triadic closure, all of these ties should be realized in the actual edgelist
+# Here, we do call rbindlist function again to create undirected list
+
+edges[,1:2]
+edges$alter
+edges$ego
+
+real_edges = rbindlist(list(edges[,1:2], 
+                            data.table(cbind(edges$alter, 
+                                             edges$ego))), 
+                       use.names=FALSE)
+
+# We can scan the  closed to ones that actually are closed in the real data
+# stc = strong triadic closure
+# Here, we are combining first column and second column of the strong_triadic_closure element-wise separated by comma
+stc = paste(strong_triadic_closure[,1],
+            strong_triadic_closure[,2],
+            sep=",")
+stc
+
+# Here, we are combining ego and alter column of the real_edges list element-wise separated by comma
+real = paste(real_edges$ego, 
+             real_edges$alter, 
+             sep=",")
+real
+
+
+# It returns which triples with two strong ties are closed
+stc[(stc %in% real)] # 27 pairs
+
+# It returns which triples with two strong ties aren't closed
+stc[!(stc %in% real)] # 77 pairs
+
+# Computes what proportion of strong triadic closure are realized
+mean(stc %in% real) # About 26 percent
+
+# Computes what proportion of strong triadic closure is not realized
+1 - mean(stc %in% real) # About 74 percent
+
+# both results suggest moderate alignment to triadic closure
+# mean value being greater than median value also suggests that some people may have really strong relationships (positively skewed distribution)
+```
+Both mean and median value suggest that there exists some level of alignment to triadic closure; however, mean value (51.6 percent) being greater than median value (26 percent) also suggests that each node is most likely to have strong relationships, forming a sort of positively skewed distribution.
+
+
+## Question 3 - Part A
+```{r}
+############## Question 3 - Part A
+
+# Compute betweenness on the edges in a network and the vertices. This is a good measure of the flow of information and resources through a network. 
+# Calculate the edge-level betweenness for both of the types of tie. 
+
+# Here, we calculate the betweenness measure for social network
+# https://igraph.org/r/doc/betweenness.html 
+social_between = edge.betweenness(complete_network,
+                                  e = E(complete_network)[get.edge.attribute(complete_network, name = "social_tie")!=0])
+
+social_between
+
+# Here, we calculate the betweenness measure for task network
+task_between = edge.betweenness(complete_network, 
+                                e = E(complete_network)[get.edge.attribute(complete_network, name = "task_tie")!=0])
+
+task_between
+```
+
+## Question 3 - Part B
+```{r}
+############## Question 3 - Part B
+
+# Here, we combine the betweenness result with a list containing the tie strengths
+# does high betweenness tend to be related to the presence of a strong tie or weak ties?
+
+# compare across mean
+social_strong = edges$social_tie > mean(edges$task_tie[edges$task_tie > 0])
+task_strong = edges$task_tie > mean(edges$task_tie[edges$task_tie > 0])
+
+
+cor(social_between, 
+    social_strong[get.edge.attribute(complete_network,
+                                     name = "social_tie")!=0]) # - 0.27
+cor(task_between, 
+    task_strong[get.edge.attribute(complete_network,
+                                   name = "task_tie")!=0]) # 0.23
+
+# Correlation to social networks seem to be weak from the observation that the correlation is around -0.27, and correlation to task networks seem to be also weak from the observation that correlation is about 0.23. It doesn't make sense because I expected node 22 to have a high level of betweenness as it acts as a broker in this context. 
+
+# We can also plot igraph here
+plot(complete_network,
+     vertex.label=V(complete_network)$name,
+     layout=layout.fruchterman.reingold, 
+     vertex.label.color="black",
+     vertex.size = 30, 
+     edge.arrow.size=.3,
+     edge.curved=FALSE,
+     main="Complete Network")
+```
+Correlation to social networks seem to be weak from the observation that the correlation is around -0.27, and correlation to task networks seem to be also weak from the observation that correlation is about 0.23. 
+
+This result did not make sense to me at first because I expected node 22 to have a high level of betweenness as it acts as a broker in this context. 
+
+However, given the number of weak ties vs strong tie, low number makes sense. If we were to have stronger tie, there might have been more observation of betweenness.
+
+
+## Question 4
+```{r}
+############## Question 4
+
+# How many pairs of nodes do not have walks between one another? 
+
+# we can check using the complete_network where distance becomes infinite
+zero_walk = distances(complete_network) == Inf
+sum(zero_walk) # 76
+
+# we can check using the social_network where distance becomes infinite
+zero_walk = distances(social_network) == Inf
+sum(zero_walk) # 68
+
+# we can check using the task_network where distance becomes infinite
+zero_walk = distances(task_network) == Inf
+sum(zero_walk) # 72
+```
+Here, we can see that in complete_network, there are 76 pairs of nodes that do not have walks between one another.
+
+In social_network, there are 68 pairs of nodes that do not have walks between one another.
+
+In task_network, there are 72 pairs of nodes that do not have walks between one another.
+
+
+## Question 5
+```{r}
+############## Question 5
+
+# Generate and plot a network in R in which the network-level measure of degree centrality is equal to 1, and another where it is equal to 0. Would this relationship hold true for these networks for other measures of centrality, such as closeness or betweenness?
+
+# Centralization value are maximized when numerator is equal  to the denominator in following equation: sum((max(degree(net)) - degree(net))/((n-1)* (n-2)))
+
+# Let's plot a star and calculate the centralization measures
+star = make_star(20, "undirected")
+plot(star)
+
+# Verify the centralization through igraph
+centr_degree(star) # centralization = 0.9 ; theoretical_max = 380
+centralize(degree(star)) # Inf
+
+# Network-level measure of degree centrality for STAR is 1 here
+sum((max(degree(star)) - degree(star))/((vcount(star) -1)* (vcount(star)-2))) # 1
+
+# Calculate closeness and Betweenness for Star
+centr_clo(star)
+centr_betw(star)
+
+################################################################################
+
+# Let's plot a ring and calculate the centralization measures
+ring = make_ring(20)
+plot(ring)
+
+centr_degree(ring) # theoretical_max = 380; # centralization = 0
+centralize(degree(ring)) # NaN
+
+# Network-level measure of degree centrality FOR RING is 0 here
+sum((max(degree(ring)) - degree(ring))/((vcount(ring) -1)* (vcount(ring)-2))) # 0
+
+# Calculate closeness and Betweenness for Ring
+centr_clo(ring)
+centr_betw(ring)
+```
+When computing network-level measure of degree centrality, respective measure is equal to one for STAR while that of RING is equal to zero.
+
+And this relationship holds true for other measures such closeness and betweenness.

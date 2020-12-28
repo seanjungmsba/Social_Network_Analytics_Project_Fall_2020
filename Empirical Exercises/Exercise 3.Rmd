@@ -1,0 +1,378 @@
+---
+title: "Empirical_Exercise_#3_Sean_Jung"
+author: "Sean Jung"
+date: "11/13/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+rm(list = ls(all = TRUE))
+setwd("C:/Users/seanj/Desktop/Social Network Analytics/HW3")
+
+library(data.table)
+library(igraph)
+library(reshape)
+library(MASS)
+library(plm)
+library(pglm)
+library(ggplot2)
+library(zoo)
+library(panelAR)
+library(PearsonDS)
+library(ggplot2)
+library(hhi)
+```
+
+Data Wragling/Cleaning
+```{r}
+# Data Preparation/Wrangling
+districts = fread("election_results.csv", header = TRUE)
+border = fread("border_information.csv", header = TRUE)
+rain = fread("monthly_rainfall.csv", header = TRUE)
+
+# First, use rain information to get proper election period format
+rain[, year := floor(time)]
+rain_year = unique(rain[, list(rain=sum(rainfall)), by=c("district", "year")])
+
+# Scale by using empMoments
+empMoments(rain_year$rain)
+
+# We observe that there is a positive skewness, so we can take location, where its value is 0 (smallest observed value)
+# scale = s2/(xbar - c)
+scale = empMoments(rain_year$rain)[2]/empMoments(rain_year$rain)[1]
+
+# shape = (sbar - c)^2/s2
+shape = empMoments(rain_year$rain)[1]^2/empMoments(rain_year$rain)[2]
+
+rain_year[, pearson3 := qpearsonIII(pnorm(rain, mean(rain), sd=sd(rain)), shape=shape, location=0, scale=scale)]
+
+rain_year[, spi := (pearson3 - mean(pearson3))/sd(pearson3, na.rm=TRUE), by=district]
+
+# Next, we set up droughts and floods variables from rain info using spi
+# We can sum over election years, accounting for non-regular intervals in between elections
+years = sort(unique(districts$year)) # each election year
+periods = c(list(seq(1946,1951)), lapply(seq_along(year)[-1], function(i) seq(years[i-1]+1, years[i]))) # list with years in each interval
+
+# We can set up a few with something like
+rain_year[, moderately_dry := as.numeric(spi < -1)]
+rain_year[, severely_dry := as.numeric(spi < -1.5)]
+rain_year[, extremely_dry := as.numeric(spi < -2)]
+rain_year[, moderately_wet := as.numeric(spi > 1)]
+rain_year[, severely_wet := as.numeric(spi > 1.5)]
+rain_year[, extremely_wet := as.numeric(spi > 2)]
+rain_year[, moderately_abnormal := as.numeric(spi > 1 | spi < -1)]
+rain_year[, severely_abnormal := as.numeric(spi > 1.5 | spi < -1.5)]
+rain_year[, extremely_abnormal := as.numeric(spi > 2 | spi < -2)]
+
+# Next, we creating a list with just rain in each interval
+rain_elections = lapply(seq_along(periods), function(i) rain_year[year %in% periods[[i]]])
+
+spicols = colnames(rain_year)[(ncol(rain_year)-8):ncol(rain_year)]
+
+# -------------------------------------------------------------------------
+
+rain_elections = lapply(seq_along(periods), function(i) rain_elections[[i]][, (spicols) := lapply(.SD, function(x) sum(x)), .SDcols = spicols, by = district])
+
+rain_elections = lapply(seq_along(periods), function(i) rain_elections[[i]][, spi := mean(spi), by = district])
+
+rain_elections = lapply(seq_along(periods), function(i) rain_elections[[i]][, year := as.integer(max(periods[[i]])), by = district])
+
+rain_elections = lapply(seq_along(periods), function(i) rain_elections[[i]][, rain := sum(rain), by = district])
+
+spi_elections = lapply(seq_along(periods), function(i) unique(rain_elections[[i]][, list(moderately_dry = moderately_dry, severely_dry = severely_dry, extremely_dry = extremely_dry, moderately_wet = moderately_wet, severely_wet = severely_wet, extremely_wet = extremely_wet, moderately_abnormal = moderately_abnormal, severely_abnormal = severely_abnormal, extremely_abnormal = extremely_abnormal, spi = spi, year = year, rain = rain, district = district,  period = i)]))
+
+spi_elections = rbindlist(spi_elections)
+
+setkeyv(spi_elections, c("district", "year"))
+setkeyv(districts, c("district", "year"))
+districts = merge(districts, spi_elections)
+
+# By using rbindlist(), we can make border edge list undirected
+border = rbindlist(list(border, data.table(cbind(border$district, border$focal_district))), use.names = FALSE)
+
+districts[year == 1985 & district == "Amritsar", dup := 1]
+districts[year == 1985 & district == "Amritsar", year := 1984]
+
+cols = colnames(districts)[-c(1:3,ncol(districts))]
+
+districts[year == 1984 & district == "Amritsar", (cols) := lapply(.SD, function(x) max(x)), .SDcols = cols]
+
+districts = districts[is.na(dup)]
+districts[,dup := NULL]
+
+districts[year == 1985, year := 1984]
+
+dwide = reshape(districts, idvar="district", timevar="year", direction="wide")
+
+years = unique(districts$year)
+focal_vars =  c(sapply(seq_along(years), function(i) paste("spi.",years[i],sep ="")),
+                sapply(seq_along(years), function(i) paste("moderately_dry.",years[i],sep ="")),
+                sapply(seq_along(years), function(i) paste("severely_dry.",years[i],sep ="")),
+                sapply(seq_along(years), function(i) paste("extremely_dry.",years[i],sep ="")),
+                sapply(seq_along(years), function(i) paste("moderately_wet.",years[i],sep ="")),
+                sapply(seq_along(years), function(i) paste("severely_wet.",years[i],sep ="")),
+                sapply(seq_along(years), function(i) paste("extremely_wet.",years[i],sep ="")),
+                sapply(seq_along(years), function(i) paste("moderately_abnormal.",years[i],sep ="")),
+                sapply(seq_along(years), function(i) paste("severely_abnormal.",years[i],sep ="")),
+                sapply(seq_along(years), function(i) paste("extremely_abnormal.",years[i],sep ="")),
+                sapply(seq_along(years), function(i) paste("new_parties.",years[i],sep ="")),
+                sapply(seq_along(years), function(i) paste("rain.",years[i],sep ="")),
+                sapply(seq_along(years), function(i) paste("total_parties.",years[i],sep =""))
+)
+
+alter_table = setNames(data.table(matrix(data = rep(0, nrow(dwide)*length(years)), nrow = nrow(dwide), ncol = length(focal_vars))), paste("adj_",focal_vars,sep =""))
+
+adjs = lapply(seq_len(nrow(dwide)), function(j) border$district[ border$focal_district == dwide$district[j]])
+
+dwide_df = data.frame(dwide)
+View(dwide_df)
+
+
+for(i in seq_along(focal_vars)){
+  for(j in seq_len(nrow(dwide))){
+    alter_table[j,i] = mean(unlist(dwide[district %in% adjs[[j]],colnames(dwide)==focal_vars[i],with = FALSE]), na.rm = TRUE)
+  }
+}
+
+View(alter_table)
+
+dwide = cbind(dwide, alter_table)
+
+districts_adjrain = reshape(dwide, idvar= "district", varying = colnames(dwide)[2:ncol(dwide)], sep = ".", timevar = "year", direction = "long")
+
+View(districts_adjrain)
+colnames(districts_adjrain)
+```
+
+Question 1
+```{r}
+# (A) Create a figure, for example, a scatter plot, showing the visual relationship between the average SPI in a district across each year from the prior election-or from the beginning of the data for the first election-leading up to the current election, and the number of political parties that are founded in a district. Consider the party to be "founded" if it has not competed in an election in this district prior to this election
+
+# Define lagging variables
+cols = c("moderately_dry", "severely_dry", "extremely_dry", "moderately_wet", "severely_wet", "extremely_wet", "moderately_abnormal", "severely_abnormal", "extremely_abnormal", "spi", "rain", "period", "adj_moderately_dry", "adj_severely_dry", "adj_extremely_dry", "adj_moderately_wet", "adj_severely_wet", "adj_extremely_wet", "adj_moderately_abnormal", "adj_severely_abnormal", "adj_extremely_abnormal", "adj_new_parties", "adj_rain", "adj_total_parties")
+
+colnames(districts_adjrain)
+
+lags = paste("l_",cols,sep="")
+
+setorderv(districts_adjrain, c("district", "year"))
+
+# THIS CODE IS MEANT TO ASSIGN LAG VARIABLES THAT WILL ENABLE ME TO SORT OUT VARIABLES RELATED TO POLITICAL PARTIES THAT ARE FOUND IN EACH DISTRICT. UNFORTUANTELY, CODE BELOW IS NOT WORKING. HAD IT WORKED, I WOULD HAVE ANSWERED ALL THE QUESTIONS FROM NOW ON CORRECTLY.
+districts_adjrain[, (lags) := lapply(.SD, function(x) rollapplyr(x, list(-1), mean, partial = TRUE, fill = NA)), .SDcols = cols, by = district]	
+
+# If the function above had worked, then I would be able to use loess method in geom_smooth to plot a scatterplot and aes as specified below:
+colnames(districts_adjrain)
+
+lowess_rain = ggplot(districts_adjrain, aes(rain, adj_new_parties)) + 
+  geom_smooth(method = "loess", se = F) + 
+  labs(x = "Rainfall, in ml", y = "New Parties") 
+lowess_rain
+
+lowess_spi = ggplot(districts_adjrain, aes(spi, adj_new_parties)) + 
+  geom_smooth(method = "loess", se = F) + 
+  labs(x = "Standardized Precipitation Index", y = "")
+lowess_spi
+
+# -------------------------------------------------------------------------
+
+# (B) Using the election-period level rainfall measures created above, show that the SPI is not independent from one election period to the next within a district, as well as from neighboring districts from one election period to the next. It is possible to show this relationship by regressing a district's current level of the rainfall variable on (1) its lagged value and (2) the lagged value of its neighbors' rainfall variable. For computing the neighbors' value, you can use an average of each of the surrounding districts' values. 
+
+# Include a control in the regression for the number of years in the election period, and use a fixed effects specification to control for the time-invariant features of a district as well as a control for each election period. This can be accomplished using the plm package, using a model specified in the form of plm(outcome variable ??? predictor variables, data, effect = "twoways", model = "within", index = "district"), where "twoways" "within" provide both sets of fixed effects.
+
+# By using plm() function with such variables, we can see if rain is related to that of previous year (Of course, code is not working in this case because district_adjrain is not properly defined due to the code above not working as I wish it to be; nevertheless, following code is what I would have written if everything had worked out fine)
+summary(plm(rain ~ l_rain + l_adj_rain, 
+            data = districts_adjrain, 
+            effect = "twoways", 
+            model = "within", 
+            index = "district"))
+
+# On the same note, by using plm() function with such variables, we can see if spi is related to that of previous year
+summary(plm(spi ~ l_spi + l_adj_spi, 
+            data = districts_adjrain, 
+            effect = "twoways", 
+            model = "within", 
+            index = "district"))
+
+# Based on what the graph conveys, we shall find out if rain and spi is related to each other or not. 
+
+
+# -------------------------------------------------------------------------
+
+# (C) Climate scientists consider moderate droughts to occur if the Standardized Precipitation Index falls below -1, and moderate floods to occur if it rises above 1. 
+# Create a measure that sums the number of years a district experiences either moderate droughts or floods during the interval starting from the year following the previous election up until the year of the current election. Perform the same test as in (B), using this new transformed measure. This measure will form the basis for the predictors used in the remainder of the regressions in Questions 2-5. 
+
+# Since this is a count outcome that is reported as a discrete number of years, use a regression adopted for data of this form-this can be accomplished with the pglm package, using a model specified in the form of pglm(outcome variable ~ predictor variables, data, effect = "twoways", model = "within", index = "district", family = "poisson"). What differences do you see between the estimates?
+
+# If the function, which help me define lag variable defined above had worked, I would have used following lines of code to answer this question
+summary(pglm(moderately_abnormal ~ l_moderately_abnormal + l_adj_moderately_abnormal,
+             data = districts_adjrain, 
+             effect = "twoways", 
+             model = "within", 
+             index = "district", 
+             family = "poisson")) # Based on the graph, we shall see whether these variables are related to outcome variable or not, as well as  any other differences that can be observed between the estimates
+```
+
+Question 2
+```{r}
+# 2A. Next, let's analyze whether there are more new political parties when droughts or floods occur in a district or in its neighboring districts (A) Run a regression predicting the number of new political parties that are formed as a function of the number of years a district experiences droughts or flooding in the interval starting from the year following the previous election up until the year of the current election. The number of new political parties that enter a district is a discrete count outcome, so we should use a regression format adopted for counts, as in (1C).Include a control in the regression for the number of years in the election period, and a control for the time-invariant features of a district, as in Question 1. Are certain kinds of political parties, based on the issues they cater to, more likely to be formed when a district experiences extreme weather?
+
+# Create 'year' and 'interval' columns that are required to perform the regression below
+years = sort(years)
+for(i in seq_along(years)[-1]){
+  districts_adjrain[year == years[i], 
+                    interval := year - years[i - 1]]
+}
+
+# By using pglm() function, we can run a regression predicting the number of new political parties that are formed as a function of the number of years a district experiences droughts (moderately_abnormal) or flooding in the interval starting from the year following the previous election up until the year of the current election. Unfortunately, the output of this code will not be returned as the code earlier doesn't work
+summary(pglm(adj_new_parties ~ moderately_abnormal + interval, 
+             data = districts_adjrain, 
+             effect = "twoways", 
+             model = "within", 
+             index = "district", 
+             family = "poisson"))
+
+# -------------------------------------------------------------------------
+
+# 2B. Now that we have established the baseline effect, we can look at how political activity stimulated by droughts or floods in one district might affect political activity in another district. 
+
+# Use a similar regression to (A) to show that, even when taking into account a district's own droughts and floods, that district's degree of political founding will also depend on the number of years its neighboring districts experience years of droughts or flooding in the interval starting from the year following two elections ago, up until the year of the previous election-the election lead-up interval before the current one. Include a control in the regression for the number of 'years' in the current election period, and a control for the 'time-invariant features' of a district
+
+# By using panelAR() function, I would be able to find out whether new parties are more likely to be formed in the times when there are frequent droughts and floods
+# https://www.rdocumentation.org/packages/panelAR/versions/0.1/topics/panelAR
+districts_adjrain_df = as.data.frame(districts_adjrain)
+summary(panelAR(adj_new_parties ~ moderately_abnormal + year + interval, 
+                data = districts_adjrain_df, 
+                panelVar = "district", 
+                timeVar = "year", 
+                rho.na.rm = TRUE, 
+                autoCorr = "psar1", 
+                panelCorrMethod = "phet"))
+```
+
+Question 3
+```{r}
+# Extreme weather events like droughts or floods can erode the stability of political systems and wear away at the entrenched power bases of large, national-scale parties that have difficulty responding to the needs of affected regions. 
+
+# Perform a regression similar to Question 2B to determine whether experiencing droughts or floods relate to political concentration. The Herfindahl Index, or HHI, is a measure of political concentration that measures the degree to which a few parties command the majority of the shares of votes in each election: Herfindahl = sigma(vote sharei)^2 where the vote share is the count of votes divided by the total number of votes received by all candidates in the election in this district in this election period. 
+
+# The HHI can be computed with the HHI package using the hhi() function. What does this regression illustrate in terms of the HHI's concentration or fragmentation of political power in districts affected by extreme weather?
+
+summary(panelAR(adj_total_parties ~ moderately_abnormal +
+                l_adj_moderately_abnormal + interval + year, 
+                data = districts_adjrain_df, 
+                panelVar = "district", 
+                timeVar = "year", 
+                rho.na.rm = TRUE, 
+                autoCorr = "psar1", 
+                panelCorrMethod = "phet"))
+
+# If the code had worked, the output of the result would shed light on whether experiencing droughts or floods relate to political concentration. I would hypothesize that extreme weather (droughts and floods) is related to lower levels of political concentration as it hinder political parties' ability to gather their power of influence that they can impose upon.
+
+# HHI() function - https://rdrr.io/cran/hhi/man/hhi.html 
+# Had the code above worked smoothly, this is the function I would have used to compute HHI
+s=c(moderately_abnormal, l_adj_moderately_abnormal, interval, year)
+hhi(districts_adjrain_df, s)
+```
+
+Question 4
+```{r}
+# Data Preparation Part (HELP FROM CLASSMATES)
+# Let's start by getting the unique parties that contest in each year from the variable 'districts_adjrain' 
+dist_parties = unique(districts_adjrain[,c("district", "year","party_name")])
+colnames(dist_parties)[colnames(dist_parties) == "party_name"] = "party"
+
+# Next, we can subset to district. Then, we can split by district
+dist_parties = dist_parties[district %in% dwide$district]
+setorderv(dist_parties, c("district", "year"))
+dp_district = split(dist_parties, f = dist_parties$district)
+
+# Next, by using lapply(), I would create then create mini-tables for each district's neighbors. Then, initialize a list so that addition of parties that have appeared in neighbors into an empty list would be rendered possible
+dp_district_neighbor = lapply(seq_along(dp_district), 
+                              function(i) dist_parties[district %in% adjs[[i]]])
+dp_district_neighbor_any_year = list()
+
+# By using for loop, we can synthesize each ij element to contain the parties that have appeared in district i's neighbors, before year j
+for(i in seq_along(dp_district)){
+  years_local = unique(dp_district[[i]]$year)
+  dp_district_neighbor_any_year[[i]] = list()
+  for(j in seq_along(years_local)){ # nested for loop
+    dp_district_neighbor_any_year[[i]][[j]] = dp_district_neighbor[[i]][year < years_local[j]] # by specifying year < years_local[j], we would be able to subset the parties that have been introduced before year j
+  }
+}
+
+# We can create an object called 'dp_district_any_year' to set a basis for comparison
+dp_district_any_year = lapply(seq_along(dp_district), function(i) split(dp_district[[i]], f = dp_district[[i]]$year))
+
+# By using for loop again, we can check to see if the parties have appeared before
+for(i in seq_along(dp_district)){
+  for(j in seq_along(dp_district_any_year[[i]])){
+    dp_district_any_year[[i]][[j]][, same_party_any_year := party %in% dp_district_neighbor_any_year[[i]][[j]]$party]
+  }
+}
+
+# Bind them together using rbindlist() and aggregate the value of same_party_any_year into a variable named diffused_any_year and store its unique dp_diffused_any_year into dp_diffused_any_year_panel
+dp_diffused_any_year = rbindlist(lapply(seq_along(dp_district), function(i) rbindlist(dp_district_any_year[[i]])))
+
+panel = unique(dp_diffused_any_year[, list(diffused_any_year = sum(same_party_any_year)), by = c("district", "year")])
+
+setkeyv(panel, c("district", "year"))
+setkeyv(districts_adjrain, c("district", "year"))
+
+# We are merging back two dataset together by using merge() function
+districts_adjrain = merge(districts_adjrain, 
+                          panel, 
+                          all.x = TRUE)
+
+# We can create a new column called 'non_diffused_any_year' by subtracting the value the value from diffused_any_year column from the value in adj_new_parties. Then, put them into a data frame format again as before.
+districts_adjrain[, non_diffused_any_year := adj_new_parties - diffused_any_year]
+districts_adjrain_df = data.frame(districts_adjrain)
+
+# Then, we can set up similar regression as we did in the previous questions (This code won't run because lag variable 'l_adj_moderately_abnormal' couldn't be defined due to an error earlier)
+summary(panelAR(diffused_any_year ~  moderately_abnormal + 
+                data = districts_adjrain_df, 
+                panelVar = "district", 
+                timeVar = "year", 
+                rho.na.rm = TRUE, 
+                autoCorr = "psar1", 
+                panelCorrMethod = "phet")) # From the result, we shall see if there is relationship to parties that have contested elections in neighboring districts in the past
+
+summary(panelAR(non_diffused_any_year ~  moderately_abnormal +
+                l_adj_moderately_abnormal + interval + year, 
+                data = districts_adjrain_df, 
+                panelVar = "district", 
+                timeVar = "year", 
+                rho.na.rm = TRUE, 
+                autoCorr = "psar1", 
+                panelCorrMethod = "phet")) # From the result, we shall see if there is relationship to parties that have NOT contested elections in neighboring districts in the past
+```
+
+Question 5
+```{r}
+# Last, we want to understand how political diffusion processes relate to the overall political trends in the country. One theory is that new parties are more likely to diffuse into areas that are more closely contested in terms of political competition, creating space for more issues to be discussed. 
+
+# To test this theory, run a regression predicting the likelihood of a new political party contesting an election in a district, that has contested an election in a neighboring district in any election period, as a function of the district's prior political concentration given by the HHI of the vote share of the issues covered by its political parties in "party_issue".
+
+summary(panelAR(diffused_any_year ~  party_issue +
+                interval + year, 
+                data = districts_adjrain_df, 
+                panelVar = "district", 
+                timeVar = "year", 
+                rho.na.rm = TRUE, 
+                autoCorr = "psar1", 
+                panelCorrMethod = "phet"))
+
+# Another theory is that new parties are more likely to diffuse into areas where a national party has suffered a recent loss, creating a power vacuum. 
+
+# To test this theory, run a regression predicting the likelihood of a new political party contesting an election in a district, that has contested an election in a neighboring district in any election period, as a function of the number of losses a party of national scope suffers in the district and its neighboring districts in the prior election. Does either one of the theories seem more plausible?
+
+summary(panelAR(diffused_any_year ~ losses + district
+                interval + year, 
+                data = districts_adjrain_df, 
+                panelVar = "district", 
+                timeVar = "year", 
+                rho.na.rm = TRUE, 
+                autoCorr = "psar1", 
+                panelCorrMethod = "phet"))
+
+# I can't figure out the code for this one even after reaching out for help. At least to answer the question asked, I would hypothesize that results of regression is most likely to suggest that neither of theories would be plausible because people are more likely to behave based on their own political interest rather than as acting in the specific interests of their neighbors and their political parties.
+```

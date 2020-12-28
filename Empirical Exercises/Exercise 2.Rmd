@@ -1,0 +1,810 @@
+---
+title: "Empirical_Exercise_#2_Sean_Jung"
+author: "Sean Jung"
+date: "10/29/2020"
+output: html_document
+runtime: shiny
+---
+
+# Instruction
+
+For this exercise, we will analyze groups and clusters in the networks of venture capital firms. Venture capital firms often co-invest with each other on startup venture as part of syndicate investment teams. 
+
+The ties formed by co-investing together influence the strategy and performance of the venture capital firms and the entrepreneurs they fund, and certain positions in this network are more beneficial than others.
+
+Information about venture capital firms and their investments is contained in several files: Files generating network data. The two files “Funding_events_7.14.csv” and “Funding_events_7.14_page2.csv” contain information on venture capital investment events, from June 1981 until July 2014.
+
+• In these files, each row represents an investment round made by one or more venture capital firms into a startup company
+• The venture capital firms are listed in the column “Investors”
+• The startup company is listed in the column “Portfolio Company Name”
+• Consider a relationship tie to exist between venture capital firms when the firms invest together in the same round of a portfolio company—the firms show up in the same row together
+• Consider firms as tied together if they invest together at least once—ignore multiple instances of a relationship
+• Allow relationships to persist over time, so that the network in July 2014 is comprised of all cumulative ties that have occurred up to this point
+
+```{r setup, include=FALSE}
+# Set working directory
+setwd("C:/Users/seanj/Desktop/Social Network Analytics/HW2")
+
+# Import packages
+library(data.table)
+library(igraph)
+library(network)
+library(plotly)
+library(stringr)
+```
+
+```{r eruptions, echo=TRUE}
+# Importing files
+funding1 = fread(file = "Funding_events_7.14.csv", header = TRUE)
+funding2 = fread(file = "Funding_events_7.14_page2.csv", header = TRUE)
+
+# Check the first few rows of each file
+head(funding1)
+head(funding2)
+
+# Combining two files together
+funding = rbindlist(list(funding1, funding2))
+head(funding)
+
+# Set the dealkey (Office hours)
+funding[, dealkey := seq_len(.N)]
+```
+Notice that 'Deal Date' column is in Month/Day/Year format. We want to properly encode this date so that R can recognize this as a date and allow relationships to persist over time from this point forward.
+
+```{r}
+# Encoding 'Deal Date' column
+funding[, date := as.Date(funding$`Deal Date`, "%m/%d/%y")]
+head(funding$`Deal Date`)
+
+# floor_date() takes a date-time object and rounds it down to the nearest integer value of the specified time unit
+# https://www.rdocumentation.org/packages/lubridate/versions/1.3.3/topics/floor_date 
+library(lubridate)
+funding[, month := floor_date(date, "month")]
+```
+
+```{r}
+# Set up an index for months
+months = seq.Date(min(funding$month), max(funding$month), by = "month")
+
+# Let's make a data table of two columns 'Investors' and 'Month' to ensure that we can keep track of each month and its change in network
+investors = data.table(investors = funding$Investors, 
+                       dealkey = funding$dealkey, 
+                       month = funding$month)
+
+head(investors)
+```
+As we have done in the exercise 1, extracting only the necessary information from the columns to form a investor edge list is a crucial step to move forward with the analysis (classmates helped me with this step)
+
+Here, notice that some of the values in the columns contains comma in places such as Inc, llc, etc. We need to split such concatenated data into separate values
+
+```{r}
+# The cSplit() function is designed to quickly and conveniently split concatenated data into separate values.
+# https://www.rdocumentation.org/packages/splitstackshape/versions/1.4.8/topics/cSplit
+library(splitstackshape)
+
+investors = cSplit(investors, "investors", ",")
+
+# We can avoid warning by setting such argument (office hours)
+investors = data.table(investors = funding$Investors, dealkey = funding$dealkey, month = funding$month)
+Encoding(investors$investors) = "UTF-8"
+investors[, investors := iconv(investors, "UTF-8", "UTF-8",sub="")]
+
+# Here we are using the cSplit to remove ',' from the 'investors' column
+investors = t(cSplit(investors, "investors", ","))
+
+# For the number of columns (65,123) in investors, we are applying cSplit function
+pairs = lapply(seq_len(ncol(investors)), 
+               function(i) investors[,i])
+
+# Check the pairs
+head(pairs)
+
+# Notice the difference between pairs[[1]]
+# and pairs[[1]][!is.na(pairs[[1]])] # data is more tidier as a result of subsetting non-NA values
+
+# Here, we are basically applying the for loop using the same subsetting technique we used in the previous line of code. 
+for(i in seq_along(pairs)){
+  pairs[[i]] = pairs[[i]][!is.na(pairs[[i]])]
+}
+```
+
+
+```{r}
+# Difference between [] and [[]] is that the former is used for subsetting, and the latter is used for extracting single list elements.
+# Notice that by using [[]] with length() function, we can determine the number of investors within the list, and we only want the columns that have more than 1 investors for the analysis
+pairs[[1]]
+length(pairs[[1]]) #3
+
+pairs[[2]]
+length(pairs[[2]]) #9
+
+pairs[[3]]
+length(pairs[[3]]) #2
+
+pairs[[4]]
+length(pairs[[4]]) #2
+
+pairs[[5]]
+length(pairs[[5]]) #2
+
+# sapply() function does the same job as lapply() function but returns a vector. ... sapply() function is more efficient than lapply() in the output returned because sapply() store values direclty into a vector
+# Here, we are applying sapply() along with length() function to only include pairs that have more than one investor -> this will return a vector of boolean value that flags TRUE if there is more than one investor but returns FALSE otherwise.
+index = sapply(seq_along(pairs), function(i) length(pairs[[i]]) > 3)
+
+# By subsetting vector column, we just created, we can only include a set of pairs that satisfy the criteria we specified earlier
+pairs = pairs[index]
+# By printing 'pairs', again, I can see that each vector in this variable have more than one investor
+
+length(pairs) # 30,751
+
+pairs[[1]][1] # returns month "2012-06-01"
+pairs[[1]][-1] # returns a series of vectors investors_0n
+
+# As we did in the exercise 1, here we are using combn() function along the number of vectors in pairs to generate edge list using all combinations of element taken 2 at a time
+edges = lapply(seq_along(pairs), 
+               function(i) data.table(t(combn(pairs[[i]][-(1:2)], 2)), 
+                                      dealkey = pairs[[i]][1], 
+                                      month = as.Date(pairs[[i]][2], "%Y-%m-%d")))
+
+# by calling 'edges', we now see that edges is a data table consists of three columns V1, V2, and month. 
+
+# now we want to assign V1 to be "start" and V2 to be "end"
+# colnames(edges) = c("start", "end", "month") returns error code: attempt to set 'colnames' on an object with less than two dimensions
+
+# Calling edges$V1, edges$V2, or edges$month returns NULL value because we can't use dollar ($) sign on matrix, and we can circumvent this error by calling rbindlist() function
+
+edges = rbindlist(edges) # Now, calling edges$V1, edges$V2, or edges$month does return a respective values in each column
+
+# We can also assign the column names using colnames() function
+colnames(edges) = c("from", "to", "dealkey", "month") # by calling 'edges' again, we now see that all the columns are named accordingly
+
+# We are only concerned with edges that are less than 5 characters
+unique(c(edges$from[nchar(edges$from) < 5], edges$to[nchar(edges$to) < 5]))
+
+# Here, we remove the edge list where the edge list doesn't reflect actual company
+edges = edges[from != "<NA>" & from != "Ltd." & from != "Inc." & from != "LLC" & from != "Inc" & from != "LP" & from != "LLC." & from != "Ltd" & from != "L.P." & from != "S.A" & from != "Corp" & from != "a.s." & from != "llc" & from != "S.A." & from != "LTD" & to != "<NA>" & to != "Ltd." & to != "Inc." & to != "LLC" & to != "Inc" & to != "LP" & to != "LLC." & to != "Ltd" & to != "L.P." & to != "S.A" & to != "Corp" & to != "a.s." & to != "llc" & to != "S.A." & to != "LTD" ,]
+
+# Here, we are setting up interarrival threshold (office hours)
+setorderv(edges, c("from", "to", "dealkey"))
+edges[, previous := c(NA, month[-.N]), by= c("from", "to")]
+edges[, interarrival := as.numeric(month) - previous]
+
+# We can plot a histogram to confirm whether we are doing everything correctly
+hist(edges$interarrival)
+
+```
+
+```{r}
+# We are defining tie as decaying i once it is past 90th percentile of interarrival period
+edges[, threshold := quantile(interarrival, .90, na.rm = TRUE)]
+edges$threshold[1] #around 1278 days - about 3 years
+edges[is.na(interarrival), interarrival := 0]
+
+# We are making sure that repeated ties are accounted as edge attributes for later
+setorderv(edges, c("from", "to", "dealkey"))
+edges[, repeated_ties := seq_len(.N) - 1, by = c("from", "to")]
+
+# By using lapply(), we are using edges up to a given month, for each month in the data
+month_edges = lapply(seq_along(months), function(i) edges[month <= months[i]])
+
+# Here we are using same lapply() to apply function across
+month_edges = lapply(seq_along(months), function(i) month_edges[[i]][, tie_age := months[i] - month])
+
+month_edges = lapply(seq_along(months), function(i) month_edges[[i]][tie_age <= threshold,])
+
+# Now along the lines of months_edges, we are making a funding_network
+funding_network = lapply(seq_along(month_edges), function(i) graph.data.frame(month_edges[[i]][,c("from", "to", "repeated_ties")], directed = FALSE))
+
+funding_network_simplified = lapply(seq_along(funding_network), function(i) simplify(funding_network[[i]], remove.multiple = TRUE))
+
+length(funding_network) # 475
+```
+
+############## Question 1 - Part A
+
+1. First, perform the Kevin Bacon Hollywood Actor exercise on the venture capital firm network. For constructing this network, we want to avoid the possibility that the network simply grows more dense over time, so we want to allow old ties to drop out of the network. 
+
+We will consider a tie to have “decayed” if it is not renewed within a certain amount of time: a time window greater than 90 percent of all renewal windows for all ties in the network.
+
+These decayed ties should be removed from the current construction of the network. Use this trimmed network for the remainder of the exercises. 
+
+Consider the most central firm to be the firm with the highest closeness centrality, as in the Hollywood Actor example. Does the firm with the highest closeness centrality also have the shortest average path length?
+ 
+```{r}
+# What is the closeness centrality measure for all 475 networks in this variable?
+length(funding_network) # 475
+head(closeness(funding_network[[length(funding_network)]]))
+
+# By subsetting which.max(), I can find the firm with the highest closeness centrality
+closeness(funding_network[[length(funding_network)]])[which.max(closeness(funding_network[[length(funding_network)]]))]  # Greylock Partners with 6.962e-05
+```
+
+############## Question 1 - Part B
+Which firm is the center of the venture capital firm network as of July 2014? Consider the most central firm to be the firm with the highest closeness centrality, as in the Hollywood Actor example. Does the firm with the highest closeness centrality also have the shortest average path length?
+
+```{r}
+# Find distances within the variable 'funding_network'
+# all shortest paths 
+length(funding_network) # 475
+funding_network[[length(funding_network)]]
+# + attr: name (v/c)
+# + edges from 2a2d1a9 (vertex names):
+# [1] First Round Capital   --Innovation Endeavors            
+# [2] Active Angel Investors--Innovation Ventures             
+# [3] Active Angel Investors--Magnify.net                     
+# [4] Active Angel Investors--New York Angels                 
+# [5] Active Angel Investors--NextStage Capital               
+# [6] Active Angel Investors--Ogden Capital                   
+# [7] Active Angel Investors--Rose Tech Ventures              
+# [8] Active Angel Investors--Wilson Sonsini Goodrich & Rosati
+
+dist = distances(funding_network[[length(funding_network)]])
+nrow(dist) # 139
+
+# Here, when dist == inf (whe firms are unreachable), we are replacing its value with the number of rows or size of the network
+dist[dist == Inf] = nrow(dist)
+
+# By using apply() function, we are calculating the average value of its distance value across rows
+avg_dist = apply(dist, 1, mean)
+
+# What would be the average shortest path length for all venture capitals?
+mean(avg_dist) # 120.25
+
+distances = distances(funding_network[[length(funding_network)]])
+nrow(distances) # 139
+
+sum(distances(funding_network[[length(funding_network)]]) == Inf)/2 # 8340
+# Such a high number makes sense since many of them  are not reachable from each other -> It indicates that there are about 8340 unreachable pair that will basically increase the value of shortest path even though the value of the distances is small.
+
+# by subsetting avg_dist using which.min(), we can find a firm that has the smallest average path length or the highest closeness centrality
+avg_dist[which.min(avg_dist)] # Greylock Partners 103.3381
+
+# Based on the result, Greylock Partners has the highest closeness centrality, indicating this firm also has the shortest average path length
+```
+
+############## Question 2 - Part A
+Construct a figure similar to Class Session 4’s, plotting the average k-core of each venture capital firm in the network over time. This can be computed using the igraph function coreness. 
+
+On the x-axis should be time. On the y-axis should be the highest-degree k-core each venture capital firm belongs to, averaged over all firms in the network up to that month.
+
+```{r}
+# By using lapply() function, we are generating data table that consists of month and its respective average core compute mean highest-degree k-core for each month
+average_kcore = lapply(seq_along(funding_network), 
+                    function(i) data.table(month = months[i], 
+                                           mean_kcore = mean(coreness(funding_network[[i]]))))
+
+# head(average_kcore) doesn't show anything meaningful other than index value
+
+# Make sure to use rbindlist() after lapply() function
+average_kcore = rbindlist(average_kcore)
+
+head(average_kcore)
+#          month mean_kcore
+#  1: 1981-06-01    2.00000
+#  2: 1981-07-01    2.00000
+#  3: 1981-08-01    2.00000
+#  4: 1981-09-01    2.00000
+#  5: 1981-10-01    2.00000
+
+# Plot 'avg_kcore_plot'
+# https://www.rdocumentation.org/packages/plotly/versions/4.9.2.1/topics/plot_ly
+avg_kcore_plot = plot_ly(average_kcore, 
+            x = ~month, 
+            y = ~mean_kcore, 
+            color = I("black"), 
+            mode = "lines") %>%
+  layout(xaxis = list(title = "Year")) %>%
+  layout(yaxis = list(title = "Average K-core"))
+
+avg_kcore_plot
+```
+
+
+############## Question 2 - Part B
+Does this figure appear to be similar if we only consider unique ties as opposed to repeated ties in the calculation? 
+
+```{r}
+# By simplifying the funding network, we can remove the repeat tiesc
+funding_network_simplified = lapply(seq_along(funding_network), 
+                                    function(i) simplify(funding_network[[i]], remove.multiple = TRUE))
+
+average_kcore_simplified = lapply(seq_along(funding_network_simplified), 
+                           function(i) data.table(month = months[i], 
+                                                  mean_kcore = mean(coreness(funding_network_simplified[[i]]))))
+
+average_kcore_simplified = rbindlist(average_kcore_simplified)
+
+avg_kcore_simplified_plot = plot_ly(average_kcore_simplified, 
+                                    x = ~month, 
+                                    y = ~mean_kcore,
+                                    mode = "lines",
+                                    color = I("black")) %>%
+  layout(xaxis = list(title = "Year")) %>%
+  layout(yaxis = list(title = "Average K-core")) 
+  
+avg_kcore_simplified_plot # compared to the previous plot, we can notice in this graph that average k-core value reached its peak around 2005-2010; two plots look quite different and convey different messages from one another.
+```
+
+############## Question 2 - Part C
+What does this suggest about the nature of relationships in the co-investment network?
+
+```{r}
+# To answer this question about the relationships in the network, we would need to create some edge list
+
+# We are using for loop and seq_along() to create a year column
+for(i in seq_along(month_edges)){
+  month_edges[[i]][, year := year(month)]
+}
+
+months[1] # "1981-06-01"
+year(months)[1] # 1981
+
+# By using year() function, we can create index variable
+year_index = year(months)
+head(year_index) # 1981 1981 1981 1981 1981 1981
+
+months_edge_decay = lapply(seq_along(month_edges), 
+                             function(i) month_edges[[i]][, tie_age := year_index[i] - year])
+
+months_edge_decay = lapply(seq_along(month_edges), 
+                           function(i) months_edge_decay[[i]][tie_age < 6,])
+
+funding_network_decay = lapply(seq_along(month_edges), 
+                               function(i) graph.data.frame(months_edge_decay[[i]][,c("from", "to")], directed = FALSE))
+
+### Using lapply() to create data table
+average_kcore_decay = lapply(seq_along(funding_network), 
+                             function(i) data.table(month = months[i], 
+                                                    mean_kcore = mean(coreness(funding_network_decay[[i]]))))
+
+average_kcore_decay = rbindlist(average_kcore_decay)
+
+head(average_kcore_decay)
+
+#           month mean_kcore
+#  1: 1981-06-01   2.000000
+#  2: 1981-07-01   2.000000
+#  3: 1981-08-01   2.000000
+#  4: 1981-09-01   2.000000
+#  5: 1981-10-01   2.000000
+
+# Plot 'avg_kcore_simplified_plot'
+avg_kcore_simplified_plot = plot_ly(average_kcore_decay, 
+             x = ~month, 
+             y = ~mean_kcore,
+             color = I("black"), 
+             mode = "lines",
+             type = "scatter") %>%
+  layout(xaxis = list(title = "Year")) %>%
+  layout(yaxis = list(title = "Average K-core")) 
+  
+avg_kcore_simplified_plot
+#  sparser graph if repeated ties are not included in k-core calculation and upward trend flattens out towards the end
+
+# By using t-test, we are comparing the average K-core value
+t.test(average_kcore$mean_kcore, 
+       average_kcore_decay$mean_kcore)
+# data:  average_kcore$mean_kcore and average_kcore_decay$mean_kcore
+# t = -7.0463, df = 771.92, p-value = 4.076e-12
+# alternative hypothesis: true difference in means is not equal to 0
+# 95 percent confidence interval:
+#  -1.779179 -1.003849
+# sample estimates:
+# mean of x mean of y 
+#  5.386246  6.777760 
+
+t.test(average_kcore$mean_kcore, 
+       average_kcore_simplified$mean_kcore)
+# data:  average_kcore$mean_kcore and average_kcore_simplified$mean_kcore
+# t = 0, df = 920, p-value = 1
+# alternative hypothesis: true difference in means is not equal to 0
+# 95 percent confidence interval:
+#  -0.2905507  0.2905507
+# sample estimates:
+# mean of x mean of y 
+# 5.386246  5.386246
+
+# From the result, we can see that average k-core values are higher when network includes all ties and when decay is not present, indicating that unique ties or ties that are well-groomed are not likely to grow dense over the period of time. 
+
+# Based on the result of the t-test, we can see that well-groomed ties may be a better measure as it doesn't include the firms that are not active anymore.
+```
+
+############## Question 3 - Part A
+(A) Use the co-investment network’s concentration to determine if it tends towards a coreperiphery structure over time and demonstrate this visually. Begin the analysis after the very early period of the data when all of the firms have the same eigenvector centrality.
+
+Also illustrate a figure, with one plot for one month from each calendar year in the data, that shows the range of concentration scores for each partition size p in the network for that month’s cross-section.
+
+----------- Please note that block of code for Question 3 (part A) is not running, and I have done my best to articulate what I would have done if the code would be running without error code 
+
+```{r}
+# Here, we are calculating eigenvector centrality measure using funding_network_decay to measure the global coreness (ERROR)
+eigen_decay = lapply(seq_along(funding_network), 
+                      function(i) data.table(node = V(funding_network_decay[[i]])$name, eigencentrality = eigen_centrality(funding_network_decay[[i]])$vector, month = i))
+
+-------------------------------------------------------------------------------
+# Use rbindlist() to properly coerce it into a data table
+eigen_decay = rbindlist(eigen_decay)
+
+saveRDS(eigen_decay, file = "sean_data.rds")
+# Restore the object
+readRDS(file = "sean_data.rds")
+
+# head(eigen_decay)
+#                         node 
+#     1:      Greylock Partners
+#     2:   Sutter Hill Ventures
+#     3:                Venrock
+#     4:                Venrock
+#     5:      Greylock Partners
+
+#        eigencentrality month
+#     1:    1.000000e+00     1
+#     2:    1.000000e+00     1
+#     3:    1.000000e+00     1
+#     4:    1.000000e+00     2
+#     5:    1.000000e+00     2
+
+# By using setorderv(), we can reorder the data table by "month" and "eigencentrality"
+setorderv(eigen_decay, 
+          c("month", "eigencentrality"), 
+          c(1,-1))
+
+# Here, we calculate co-investment network’s concentration to determine if it tends towards a core-periphery structure over time and demonstrate this visually
+eigen_correlation = lapply(seq_along(funding_network), 
+                           function(i) sapply(seq_len(nrow(eigen_decay[month == i])),
+                                              function(j) cor(eigen_decay[month == i, eigencentrality],c(rep(1,j),rep(0,nrow(eigen_decay[month == i]) - j)))))
+```
+
+SINCE THE PREVIOUS BLOCK OF CODE IS NOT RUNNING, I WILL WRITE OUT WHAT I AM PLANNING ON DOING IF CODE ABOVE WILL RUN 
+```{r}
+# Based on the outputs of the code above, I will probably have figured out the optimal number of partitions and set the ranges accordingly (where the n goes)
+ideal_eigen_correlation = lapply(seq_along(funding_network)[-(1:n-1)], function(i) data.table(max_correlation = max(eigen_correlation[[i]], na.rm = TRUE), ideal_correlation = which.max(eigen_correlation[[i]]), probability = which.max(cor_eigen[[i]])/length(eigen_correlation[[i]]), month = months[i]))
+
+# Using rbindlist to properly coerce it into a data.table
+ideal_eigen_correlation = rbindlist(ideal_eigen_correlation)
+
+# See the data table
+ideal_eigen_correlation
+
+# Class note: ideal size or number of partitions usually occurs between 1 and n nodes, and it can suggest core-periphery structure; here we can use lapply() function to create another data.table from eigen_correlation
+eigen_data_table = lapply(seq_along(eigen_correlation), function(i) data.table(order = seq_along(eigen_correlation[[i]]), concentration = eigen_correlation[[i]], days = i))
+
+eigen_data_table = rbindlist(eigen_data_table)
+
+eigen_data_table[, order_part := order/max(order), by = days]
+
+# Then, by using lapply() function with ggplot(), I will be able to plot ideal partitions over time.
+# Using modular operator will help us to plot from 1st month to n-1th month.
+order_plots = lapply(seq_along(funding_network)[-(1:n-1)][c(seq_along(funding_network)[-(1:n-1)]%%12 == 2)], function(i)
+  ggplot(eigen_data_table[month == i]) + 
+    geom_point(aes(x=order_part, y = concentration))
+  )
+
+# From the output of the order_plots, I will be able to figure out which network concentration seems to be growing. Also, it would be possible to figure out the proportion of the firms that are classified in the ideal partitions 
+# Also from the k-cores measurement, I will be able to figure out which network is more dense with respect its group membership
+```
+
+
+############## Question 3 - Part B
+Do you think that the recent network now exhibits more of a core-periphery structure or a structure made up of distinctly clustered components? Provide two other pieces of descriptive evidence outside of the concentration scores to support your conclusion 
+```{r}
+# We can use variety of measures to measure the core/periphery structure 
+
+# 1. We can develop a plot or descriptive statistics of how many nodes are included in different levels of k-cores by looking at distribution of coreness by using corenesss() function to see if it is evenly dispersed or not
+june_81 = 12*1
+june_86 = 12*5
+june_91 = 12*10
+june_96 = 12*15
+june_01 = 12*20
+june_06 = 12*25
+
+table(coreness(funding_network[[june_81]]))
+# 2 
+# 3 
+
+table(coreness(funding_network[[june_86]]))
+# 2 
+# 3 
+
+table(coreness(funding_network[[june_91]]))
+# 1 4 
+# 2 5 
+
+table(coreness(funding_network[[june_96]]))
+# 1  2  3  4  5  6  7  8  9 10 11 
+# 12 20 17 23 10 10 17 17  4 15 12 
+
+table(coreness(funding_network[[june_01]]))
+#  1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16  17  18  19  20 
+# 126 188 214 169 133 181 139 126 105  80  92  87  70  48  49  36  22  40  29  50 
+# 21  22  23  24  25  26  27  28  29  30  31  32 
+# 17   1   8  11  13  42   6   4   1   3  24  31 
+
+table(coreness(funding_network[[june_06]]))
+#  1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16  17  18  19  20 
+# 361 370 328 268 250 203 155 166 137 132  78  80  64  59  56  46  40  49  46  50 
+# 21  22  23  24  25  26  27  28  29  30  31  32  33  34  35  36  37  38  39  40 
+# 37  33  25  53  32  19  45  28  13  15  10  22  33  22   8  11   4   9  11   3 
+# 41  42  44  45  46  47  48  49  50 
+#  7  27   6  13   3   7   2   1  90 
+
+# As you can see from the table above, we can see that firms become members of higher-degree k-cores over time -- 50 firms in k-core with degree 92 in 2006
+
+# 2. Secondly, we can look at the distribution of closeness. For example, if some firms have high coreness measures while some firms having low coreness measures would suggest that many firms are in the vicinity of the core while some are dispersed around in the periphery
+hist(closeness(funding_network[[june_81]]))
+hist(closeness(funding_network[[june_86]]))
+hist(closeness(funding_network[[june_91]]))
+hist(closeness(funding_network[[june_96]]))
+hist(closeness(funding_network[[june_01]]))
+hist(closeness(funding_network[[june_06]]))
+
+# 3.  Thirdly, as I did in the first assignment, I can see the split of closeness statistics that emerge over time by performing a multidimensional scaling on the distance between. This will help me see how many firms appear in the core and how many in the periphery. 
+dist = distances(funding_network[[june_81]])
+dist[dist == Inf] = nrow(dist)
+mdscale1 = cmdscale(dist, k = 2)
+
+dist = distances(funding_network[[june_86]])
+dist[dist == Inf] = nrow(dist)
+mdscale5 = cmdscale(dist, k = 2)
+
+dist = distances(funding_network[[june_91]])
+dist[dist == Inf] = nrow(dist)
+mdscale10 = cmdscale(dist, k = 2)
+
+dist = distances(funding_network[[june_96]])
+dist[dist == Inf] = nrow(dist)
+mdscale15 = cmdscale(dist, k = 2)
+
+plot(mdscale1)
+plot(mdscale5)
+plot(mdscale10)
+plot(mdscale15)
+# From the plots, we can see that many firms are located on top of each other in same location, and a few firms scattered outside of this region
+
+
+# 4. Finally, we can decompose the network into its largest connected component and see if this component contains most of the firms in the network by getting the components and compare size of largest component to number of firms in the network
+components1 = clusters(funding_network[[june_91]])
+max(components1$csize)/vcount(funding_network[[june_91]]) # 0.71
+components2 = clusters(funding_network[[june_96]])
+max(components2$csize)/vcount(funding_network[[june_96]]) # 0.75
+# We can see that proportion of the largest connected component increases from 0.71 in June 1991 to 0.75 in June 1996
+```
+
+Files generating venture capital performance data
+
+The file “Venture_capital_firm_outcomes.csv” contains information about the performance of venture capital firms in each year they are active investors and also contains some information about the venture firms themselves.
+
+• The number of successful investments a venture capital firm has in any year is listed in the column “successful_investments”—successful investments represent acquisitions, IPOs, and other events in which the startup generates cash for the venture capital firm
+
+• A venture capital firm goes out of business when it cannot raise a new fund from a limited partner to make new investments—firms that go out of business have a 1 in their most recent observation in the column “out_of_business”, and otherwise this column is filled by 0s
+
+
+```{r tabsets, echo=FALSE}
+venture = fread(file = "Venture_capital_firm_outcomes.csv", header = TRUE)
+venture
+```
+
+############## Question 4 - Data prep
+```{r}
+# Import the Venture_capital_firm_outcomes using fread() and store it in a 'outcomes' variable
+outcomes = fread("Venture_capital_firm_outcomes.csv", head = TRUE)
+
+# Can use this function again
+CalStats=function(input)
+{
+  degree = degree(input, mode = "total")
+  closeness= closeness(input, mode = "total")
+  betweenness = betweenness(input)
+  pagerank = page_rank(input)$vector
+  eigencentrality= eigen_centrality(input)$vector
+  id=V(input)$name
+  output = as.data.table(list(firm_name = id, 
+                              degree = degree, 
+                              closeness = closeness, 
+                              betweenness = betweenness, 
+                              pagerank = pagerank, 
+                              eigencentrality = eigencentrality))
+  return(output)
+}
+
+# note that only need yearly stats, so can just take one stat per year from 1981-2014
+# funding_network[which.min(date)]
+# network begins in June 1981
+
+index = seq_along(funding_network)[c(seq_along(funding_network)%%12 == 1)]
+funding_network_year = funding_network[index]
+funding_network_centrality = lapply(seq_along(funding_network_year), function(i) CalStats(funding_network_year[[i]]))
+
+# add the years
+for(i in seq_along(funding_network_centrality)){
+	funding_network_centrality[[i]][, year := seq(min(year(edges$month)), max(year(edges$month)))[i]]
+}
+funding_network_centrality = rbindlist(funding_network_centrality, fill=TRUE)
+
+# merge together
+setkeyv(outcomes, c("firm_name", "year"))
+setkeyv(funding_network_centrality, c("firm_name", "year"))
+
+outcomes = merge(outcomes, funding_network_centrality)
+```
+
+############## Question 4 - Part A
+Is being more central in terms of the measures we have encountered so far–degree centrality, closeness centrality, betweenness centrality, eigenvector centrality, and PageRank centrality—related to having more more successful investments in a given year?
+
+```{r}
+# First, we can plot a histogram to see the distribution
+hist(outcomes$successful_investments) # successful investments is quite negatively distributed (right-skewed distribution); therefore, using quantile regression may be a better way to estimate the median of successful investments, rather than using the mean as it is the case in a normal regression
+
+library(Qtools)
+
+# Closeness
+rq.counts(successful_investments ~ closeness 
+          + corporate_venture_firm 
+          + monetary_size_deals_year_usdmn 
+          + early_stage_investor 
+          + year, 
+          data = outcomes, 
+          tau = .5,
+          M = 100)
+
+# Degree
+rq.counts(successful_investments ~ degree
+          +  corporate_venture_firm 
+          + monetary_size_deals_year_usdmn 
+          + early_stage_investor 
+          + year, 
+          data = outcomes, 
+          tau = .5, 
+          M = 100)
+
+# Betweenness
+rq.counts(successful_investments ~ betweenness
+          +  corporate_venture_firm 
+          + monetary_size_deals_year_usdmn 
+          + early_stage_investor 
+          + year, 
+          data = outcomes, 
+          tau = .5, 
+          M = 100)
+
+# Pagerank
+rq.counts(successful_investments ~ pagerank 
+          +  corporate_venture_firm 
+          + monetary_size_deals_year_usdmn 
+          + early_stage_investor 
+          + year, 
+          data = outcomes, 
+          tau = .5, 
+          M = 100)
+
+# Eigen
+rq.counts(successful_investments ~ eigencentrality 
+          +  corporate_venture_firm 
+          + monetary_size_deals_year_usdmn 
+          + early_stage_investor 
+          + year, 
+          data = outcomes,
+          tau = .5, 
+          M = 100)
+
+# From the different centrality measure, it is noticeable that closeness is not highly correlated to firm's likelihood of making successful investments, but other centrality measures seem to be somewhat correlated to firm's likelihood of making successful investment
+```
+
+
+############## Question 4 - Part B
+Similar to (A), is a venture capital firm being at the center of the network related to being less likely to go out of business?
+```{r}
+# A firm can only go out of business once, and its likelihood of going out of business is also related to how long it has been in operation
+
+# Notes from class: by using a logit equation on each firm's likelihood of going out of the business, a simple survival model is a discrete-time model where we estimate a logit on going out of business, we can somehow predict tenure-specific rate of failure for any firm
+outcomes[, tenure := year - first_investment_year]
+
+# Plot out a histogram as before
+hist(outcomes$tenure)
+
+# Closeness
+closeness_reg = summary(glm(out_of_business ~ closeness +
+                              corporate_venture_firm +
+                              monetary_size_deals_year_usdmn +
+                              early_stage_investor +
+                              year + factor(tenure),
+                            data = outcomes,
+                            family = "binomial"))
+closeness_reg
+
+# Degree
+degree_reg = summary(glm(out_of_business ~ degree +
+                           corporate_venture_firm +
+                           monetary_size_deals_year_usdmn +
+                           early_stage_investor +
+                           year +
+                           factor(venture_firm_industry) +
+                           factor(venture_firm_location) +
+                           factor(tenure),
+                         data = outcomes,
+                         family = "binomial"))
+degree_reg
+
+# Betweenness
+betweenness_reg = summary(glm(out_of_business ~ betweenness +
+                                corporate_venture_firm +
+                                monetary_size_deals_year_usdmn +
+                                early_stage_investor +
+                                year +
+                                factor(venture_firm_industry) +
+                                factor(venture_firm_location) +
+                                factor(tenure),
+                              data = outcomes,
+                              family = "binomial"))
+betweenness_reg
+
+# PageRank
+pagerank_reg = summary(glm(out_of_business ~ pagerank +
+                             corporate_venture_firm +
+                             monetary_size_deals_year_usdmn +
+                             early_stage_investor +
+                             year +
+                             factor(venture_firm_industry) +
+                             factor(venture_firm_location) +
+                             factor(tenure), 
+                           data = outcomes,
+                           family = "binomial"))
+pagerank_reg
+
+# Eigen
+eigen_reg = summary(glm(out_of_business ~ eigencentrality +
+                          corporate_venture_firm +
+                          monetary_size_deals_year_usdmn +
+                          early_stage_investor +
+                          year +
+                          factor(venture_firm_industry) +
+                          factor(venture_firm_location) + 
+                          factor(tenure),
+                        data = outcomes,
+                        family = "binomial"))
+eigen_reg
+
+# Using glm() function, we can see that each types of centrality is closely related to the likelihood of certain firms going out of business, which is slim to none
+```
+
+############## Question 5 (Code Doesn't Run)
+For each year a venture capital firm is in the data, identify its neighborhood of direct and indirect ties, and compute for this neighborhood:
+
+• edge density
+• average constraint of all firms
+• average repeated ties of all firms
+• total number of firms
+• average age in years of all firms
+• average cumulative successful investments of all firms
+
+Are these predictors related to experiencing more successful investments or being less likely to go out of business?
+
+---------------- Like the Question 3 (Part A), code is, unfortunately, not running on this question. Thus, as before, I have done the best I can do to articulate what function I would have used if it first line of code were to run successfully.
+
+```{r}
+outcomes_network_graph = graph_from_data_frame(outcomes)
+
+head(outcomes_network_graph)
+
+make_ego_graph(outcomes_network_graph)
+
+# Calculate edge density
+edge_density(outcomes_network_graph, loops = FALSE) # 0.000349
+
+# Calculate average constraint of all firms
+mean(constraint(outcomes_network_graph, nodes = V(outcomes_network_graph), weights = NULL)) # 0.612
+
+# Calculate average repeated ties of all firms by finding which of the ties are duplicates
+mean(duplicated(outcomes_network_graph)) # 0
+
+# Calculate total number of firms
+length((unique(outcomes$firm_name))) # 9,635
+
+# Calculate average age in years
+mean_years <- mean(edges$repeated_ties)
+mean_years # 2.25 years
+
+# Calculate average cumulative rate of successful investments of all firms in the data
+library(dplyr)
+cummean(outcomes$successful_investments)[32512] # 0.336
+```
